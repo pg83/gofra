@@ -77,9 +77,15 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 			dsts[i] = netip.AddrPortFrom(ip, cfg.ListenPort)
 		}
 
+		writers := make([]tunWriter, len(tuns))
+
+		for i, t := range tuns {
+			writers[i] = t
+		}
+
 		p := &peer{
 			dsts: dsts,
-			rx:   newReorderPipe(cfg.ReorderWindow, cfg.ReorderTimeout, tuns, logger),
+			rx:   newReorderPipe(cfg.ReorderWindow, cfg.ReorderTimeout, writers, logger),
 		}
 		peers[vip] = p
 

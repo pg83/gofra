@@ -35,6 +35,13 @@ import (
 // progress roughly in lock-step, so the kernel-side reorder
 // distance is microseconds — well within tcp_reordering's
 // tolerance.
+// tunWriter is the minimal surface reorderPipe needs from a TUN
+// device. Real *TUN satisfies it; tests pass a fake that just
+// counts writes.
+type tunWriter interface {
+	Write(b []byte) (int, error)
+}
+
 type reorderPipe struct {
 	in   chan *batch
 	outs []chan []rxItem
@@ -70,7 +77,7 @@ type batch struct {
 	items []rxItem
 }
 
-func newReorderPipe(window int, timeout time.Duration, tuns []*TUN, logger *slog.Logger) *reorderPipe {
+func newReorderPipe(window int, timeout time.Duration, tuns []tunWriter, logger *slog.Logger) *reorderPipe {
 	p := &reorderPipe{
 		in:      make(chan *batch, 64),
 		outs:    make([]chan []rxItem, len(tuns)),
@@ -175,7 +182,7 @@ func (p *reorderPipe) reorderLoop() {
 // (O(n log n) on n ≈ window/M, trivial), then tun.Write's each item
 // in order. Each writer owns one TUN queue; in-queue order is
 // preserved by kernel softirq.
-func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun *TUN) {
+func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun tunWriter) {
 	for sub := range in {
 		sort.Slice(sub, func(i, j int) bool {
 			return sub[i].seq < sub[j].seq

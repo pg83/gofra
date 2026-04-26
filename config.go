@@ -133,6 +133,12 @@ func loadConfig(path string) *parsedConfig {
 		udpSendBuf = 16 << 20
 	}
 
+	// Reorder.Window is in BATCHES (not packets) — simpler
+	// accounting in the reorder goroutine and matches the
+	// natural granularity of pipe.in. 1024 batches × batchSize=64
+	// = up to ~64k packets of headroom; in practice the timeout
+	// fires first long before that fills, the window is just a
+	// safety bound for traffic spikes.
 	reorderWindow := raw.Reorder.Window
 	if reorderWindow <= 0 {
 		reorderWindow = 1024

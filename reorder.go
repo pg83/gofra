@@ -102,10 +102,16 @@ func newReorderPipe(window int, timeout time.Duration, tuns []tunWriter, logger 
 
 // reorderLoop drains incoming batches into a flat accumulator,
 // distributes the contents into M sub-slices keyed by seq % M on
-// either threshold or timeout, then ships each sub-slice to the
-// matching writer. Writers sort.
+// either threshold (window batches) or timeout, then ships each
+// sub-slice to the matching writer. Writers sort.
+//
+// Window is counted in BATCHES, not items — simpler accounting
+// (counter increments once per receive instead of per packet)
+// and matches the natural granularity of pipe.in.
 func (p *reorderPipe) reorderLoop() {
-	accum := make([]rxItem, 0, p.window*2)
+	accum := make([]rxItem, 0, p.window*batchSize)
+
+	var batchesIn int
 
 	timer := time.NewTimer(p.timeout)
 	defer timer.Stop()
@@ -113,6 +119,8 @@ func (p *reorderPipe) reorderLoop() {
 	m := len(p.outs)
 
 	flush := func() {
+		batchesIn = 0
+
 		if len(accum) == 0 {
 			return
 		}
@@ -165,8 +173,9 @@ func (p *reorderPipe) reorderLoop() {
 			}
 
 			accum = append(accum, b.items...)
+			batchesIn++
 
-			if len(accum) >= p.window {
+			if batchesIn >= p.window {
 				flush()
 				resetTimer()
 			}

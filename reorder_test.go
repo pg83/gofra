@@ -1,56 +1,19 @@
 package main
 
 import (
-	"io"
-	"log/slog"
 	"math/rand"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// fakeTun is a tunWriter that just counts writes — no syscall, no
-// actual I/O. Drives reorder benchmarks without touching the
-// kernel.
-type fakeTun struct {
-	count atomic.Uint64
-	bytes atomic.Uint64
-}
+// fakeTun + makeFakeWriters + sumCount + silentLogger live in
+// perf.go (so the production `gofra perf` subcommand can reuse
+// them without test-only build tags).
 
-func (f *fakeTun) Write(b []byte) (int, error) {
-	f.count.Add(1)
-	f.bytes.Add(uint64(len(b)))
+func testTotal(fakes []*fakeTun) uint64 {
+	c, _ := sumCount(fakes)
 
-	return len(b), nil
-}
-
-// silentLogger discards everything — benchmarks shouldn't print.
-func silentLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError + 1}))
-}
-
-// makeFakeWriters returns m fakeTuns plus the matching tunWriter
-// slice for newReorderPipe.
-func makeFakeWriters(m int) ([]*fakeTun, []tunWriter) {
-	fakes := make([]*fakeTun, m)
-	writers := make([]tunWriter, m)
-
-	for i := range fakes {
-		fakes[i] = &fakeTun{}
-		writers[i] = fakes[i]
-	}
-
-	return fakes, writers
-}
-
-func totalCount(fakes []*fakeTun) uint64 {
-	var t uint64
-
-	for _, f := range fakes {
-		t += f.count.Load()
-	}
-
-	return t
+	return c
 }
 
 // shuffledBatch builds a batch of `size` items with sequence numbers
@@ -84,7 +47,7 @@ func drainTo(fakes []*fakeTun, expected uint64, deadline time.Duration) bool {
 	end := time.Now().Add(deadline)
 
 	for time.Now().Before(end) {
-		if totalCount(fakes) >= expected {
+		if testTotal(fakes) >= expected {
 			return true
 		}
 
@@ -125,7 +88,7 @@ func BenchmarkReorderPipeline(b *testing.B) {
 	}
 
 	if !drainTo(fakes, expected, 30*time.Second) {
-		b.Fatalf("drain timed out: got %d / %d", totalCount(fakes), expected)
+		b.Fatalf("drain timed out: got %d / %d", testTotal(fakes), expected)
 	}
 
 	b.StopTimer()
@@ -171,7 +134,7 @@ func BenchmarkReorderPipelineSorted(b *testing.B) {
 	}
 
 	if !drainTo(fakes, expected, 30*time.Second) {
-		b.Fatalf("drain timed out: got %d / %d", totalCount(fakes), expected)
+		b.Fatalf("drain timed out: got %d / %d", testTotal(fakes), expected)
 	}
 
 	b.StopTimer()
@@ -206,10 +169,10 @@ func TestReorderPipelineDelivers(t *testing.T) {
 	}
 
 	if !drainTo(fakes, totalItems, 2*time.Second) {
-		t.Fatalf("drain timed out: got %d / %d", totalCount(fakes), totalItems)
+		t.Fatalf("drain timed out: got %d / %d", testTotal(fakes), totalItems)
 	}
 
-	got := totalCount(fakes)
+	got := testTotal(fakes)
 
 	if got != totalItems {
 		t.Fatalf("count mismatch: got %d, want %d", got, totalItems)

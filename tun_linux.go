@@ -60,8 +60,9 @@ func openTUNFD(dev string, multi bool) *os.File {
 	}
 
 	// Pin the virtio_net_hdr length to 10 bytes (struct virtio_net_hdr).
-	// Newer kernels advertise virtio_net_hdr_v1 (12 bytes); we only
-	// support the legacy layout in segmentTCPv4 / parseVirtioNetHdr.
+	// Newer kernels advertise virtio_net_hdr_v1 (12 bytes); the
+	// vendored gsoSplit / virtioNetHdr layout assumes the legacy 10
+	// bytes.
 	hdrSize := uintptr(virtioNetHdrLen)
 
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cTUNSETVNETHDRSZ), uintptr(unsafe.Pointer(&hdrSize))); errno != 0 {

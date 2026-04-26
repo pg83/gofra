@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/sys/unix"
 )
 
 // peer is the dispatch entry for one remote VIP — N underlay AddrPort
@@ -154,6 +156,7 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 		buf := make([]byte, virtioNetHdrLen+65535+128)
 
 		segBufs := make([][]byte, maxGSOSegs)
+		segSizes := make([]int, maxGSOSegs)
 
 		for i := range segBufs {
 			segBufs[i] = make([]byte, mtu+128)
@@ -168,23 +171,33 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 				continue
 			}
 
-			hdr := parseVirtioNetHdr(buf[:virtioNetHdrLen])
+			var hdr virtioNetHdr
+			Throw(hdr.decode(buf[:virtioNetHdrLen]))
+
 			pkt := buf[virtioNetHdrLen:n]
 
 			switch hdr.gsoType {
-			case virtioGSONone:
+			case unix.VIRTIO_NET_HDR_GSO_NONE:
+				if hdr.flags&unix.VIRTIO_NET_HDR_F_NEEDS_CSUM != 0 {
+					if err := gsoNoneChecksum(pkt, hdr.csumStart, hdr.csumOffset); err != nil {
+						g.logger.Warn("gsoNoneChecksum failed", "err", err)
+
+						continue
+					}
+				}
+
 				send(pkt)
 
-			case virtioGSOTCPV4:
-				segs, err := segmentTCPv4(pkt, int(hdr.gsoSize), segBufs)
+			case unix.VIRTIO_NET_HDR_GSO_TCPV4:
+				segs, err := gsoSplit(pkt, hdr, segBufs, segSizes, 0, false)
 				if err != nil {
-					g.logger.Warn("gso TCPv4 segment failed", "err", err)
+					g.logger.Warn("gsoSplit TCPv4 failed", "err", err)
 
 					continue
 				}
 
 				for i := 0; i < segs; i++ {
-					send(segBufs[i])
+					send(segBufs[i][:segSizes[i]])
 				}
 
 			default:

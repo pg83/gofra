@@ -85,7 +85,7 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 
 		p := &peer{
 			dsts: dsts,
-			rx:   newReorderPipe(cfg.ReorderWindow, cfg.ReorderTimeout, writers, logger),
+			rx:   newReorderPipe(cfg.ReorderWindow, cfg.ReorderTimeout, cfg.WriterBucket, cfg.WriterTimeout, writers, logger),
 		}
 		peers[vip] = p
 
@@ -93,7 +93,14 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 			peerByDst[d] = p
 		}
 
-		logger.Info("peer registered", "vip", vip, "dsts", dsts, "reorder_window", cfg.ReorderWindow, "reorder_timeout", cfg.ReorderTimeout)
+		logger.Info("peer registered",
+			"vip", vip,
+			"dsts", dsts,
+			"reorder_window", cfg.ReorderWindow,
+			"reorder_timeout", cfg.ReorderTimeout,
+			"writer_bucket", cfg.WriterBucket,
+			"writer_timeout", cfg.WriterTimeout,
+		)
 	}
 
 	return &Gofra{

@@ -26,7 +26,12 @@ type udpConfig struct {
 
 type reorderConfig struct {
 	Window    int `json:"window"`
-	TimeoutMs int `json:"timeout_ms"`
+	TimeoutUs int `json:"timeout_us"`
+}
+
+type writerConfig struct {
+	Bucket    int `json:"bucket"`
+	TimeoutUs int `json:"timeout_us"`
 }
 
 type Config struct {
@@ -36,6 +41,7 @@ type Config struct {
 	Peers      map[string][]string `json:"peers"`
 	Udp        udpConfig           `json:"udp"`
 	Reorder    reorderConfig       `json:"reorder"`
+	Writer     writerConfig        `json:"writer"`
 }
 
 type parsedConfig struct {
@@ -51,6 +57,8 @@ type parsedConfig struct {
 	UdpSendBuf     int
 	ReorderWindow  int
 	ReorderTimeout time.Duration
+	WriterBucket   int
+	WriterTimeout  time.Duration
 }
 
 func loadConfig(path string) *parsedConfig {
@@ -133,20 +141,35 @@ func loadConfig(path string) *parsedConfig {
 		udpSendBuf = 16 << 20
 	}
 
-	// Reorder.Window is in BATCHES (not packets) — simpler
-	// accounting in the reorder goroutine and matches the
-	// natural granularity of pipe.in. 1024 batches × batchSize=64
-	// = up to ~64k packets of headroom; in practice the timeout
-	// fires first long before that fills, the window is just a
-	// safety bound for traffic spikes.
+	// Reorder.Window is in BATCHES (the reorder goroutine
+	// counts incoming pipe.in receives, not items). Real LAN
+	// reorder distance is microseconds, so the timeout below
+	// usually fires first; window is the safety bound on
+	// burst-driven accumulator size.
 	reorderWindow := raw.Reorder.Window
 	if reorderWindow <= 0 {
-		reorderWindow = 1024
+		reorderWindow = 16
 	}
 
-	reorderTimeoutMs := raw.Reorder.TimeoutMs
-	if reorderTimeoutMs <= 0 {
-		reorderTimeoutMs = 10
+	// timeout in microseconds for finer tuning. Default 1 ms.
+	reorderTimeoutUs := raw.Reorder.TimeoutUs
+	if reorderTimeoutUs <= 0 {
+		reorderTimeoutUs = 1000
+	}
+
+	// Writer.Bucket counts how many sub-slices the writer
+	// accumulates from the reorder goroutine before sorting +
+	// flushing to TUN. Bigger bucket = bigger sort batch
+	// (longer monotonic run on TUN), smaller bucket = lower
+	// per-packet latency.
+	writerBucket := raw.Writer.Bucket
+	if writerBucket <= 0 {
+		writerBucket = 16
+	}
+
+	writerTimeoutUs := raw.Writer.TimeoutUs
+	if writerTimeoutUs <= 0 {
+		writerTimeoutUs = 1000
 	}
 
 	return &parsedConfig{
@@ -161,6 +184,8 @@ func loadConfig(path string) *parsedConfig {
 		UdpRecvBuf:     udpRecvBuf,
 		UdpSendBuf:     udpSendBuf,
 		ReorderWindow:  reorderWindow,
-		ReorderTimeout: time.Duration(reorderTimeoutMs) * time.Millisecond,
+		ReorderTimeout: time.Duration(reorderTimeoutUs) * time.Microsecond,
+		WriterBucket:   writerBucket,
+		WriterTimeout:  time.Duration(writerTimeoutUs) * time.Microsecond,
 	}
 }

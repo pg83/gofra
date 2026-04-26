@@ -47,9 +47,11 @@ type reorderPipe struct {
 	outs []chan []rxItem
 	stop chan struct{}
 
-	window  int
-	timeout time.Duration
-	logger  *slog.Logger
+	window        int
+	timeout       time.Duration
+	writerBucket  int
+	writerTimeout time.Duration
+	logger        *slog.Logger
 }
 
 const (
@@ -77,18 +79,20 @@ type batch struct {
 	items []rxItem
 }
 
-func newReorderPipe(window int, timeout time.Duration, tuns []tunWriter, logger *slog.Logger) *reorderPipe {
+func newReorderPipe(window int, timeout time.Duration, writerBucket int, writerTimeout time.Duration, tuns []tunWriter, logger *slog.Logger) *reorderPipe {
 	p := &reorderPipe{
-		in:      make(chan *batch, 64),
-		outs:    make([]chan []rxItem, len(tuns)),
-		stop:    make(chan struct{}),
-		window:  window,
-		timeout: timeout,
-		logger:  logger,
+		in:            make(chan *batch, 64),
+		outs:          make([]chan []rxItem, len(tuns)),
+		stop:          make(chan struct{}),
+		window:        window,
+		timeout:       timeout,
+		writerBucket:  writerBucket,
+		writerTimeout: writerTimeout,
+		logger:        logger,
 	}
 
 	for i := range p.outs {
-		p.outs[i] = make(chan []rxItem, 8)
+		p.outs[i] = make(chan []rxItem, 64)
 	}
 
 	go p.reorderLoop()
@@ -194,20 +198,71 @@ func (p *reorderPipe) reorderLoop() {
 	}
 }
 
-// writerLoop receives one sub-slice per dispatch, sorts it by seq
-// (O(n log n) on n ≈ window/M, trivial), then tun.Write's each item
-// in order. Each writer owns one TUN queue; in-queue order is
-// preserved by kernel softirq.
+// writerLoop accumulates sub-slices from the reorder goroutine
+// until either `writerBucket` of them have come in or
+// `writerTimeout` elapses, then sorts the combined set by seq and
+// tun.Write's each item in order.
+//
+// Bigger bucket → bigger monotonic run on the TUN device, less
+// per-packet sort overhead. Smaller bucket → lower latency.
 func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun tunWriter) {
-	for sub := range in {
-		sort.Slice(sub, func(i, j int) bool {
-			return sub[i].seq < sub[j].seq
+	pending := make([]rxItem, 0, p.writerBucket*64)
+	subs := 0
+
+	timer := time.NewTimer(p.writerTimeout)
+	defer timer.Stop()
+
+	flush := func() {
+		subs = 0
+
+		if len(pending) == 0 {
+			return
+		}
+
+		sort.Slice(pending, func(i, j int) bool {
+			return pending[i].seq < pending[j].seq
 		})
 
-		for _, item := range sub {
+		for _, item := range pending {
 			if _, err := tun.Write(item.payload); err != nil {
 				p.logger.Warn("reorder writer: tun.Write failed", "err", err)
 			}
+		}
+
+		pending = pending[:0]
+	}
+
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+
+		timer.Reset(p.writerTimeout)
+	}
+
+	for {
+		select {
+		case sub, ok := <-in:
+			if !ok {
+				flush()
+
+				return
+			}
+
+			pending = append(pending, sub...)
+			subs++
+
+			if subs >= p.writerBucket {
+				flush()
+				resetTimer()
+			}
+
+		case <-timer.C:
+			flush()
+			timer.Reset(p.writerTimeout)
 		}
 	}
 }

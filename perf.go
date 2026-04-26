@@ -67,15 +67,24 @@ func silentLogger() *slog.Logger {
 func runPerf(args []string) {
 	fs := flag.NewFlagSet("perf", flag.ExitOnError)
 	writers := fs.Int("writers", 4, "number of TUN-queue writer goroutines")
-	window := fs.Int("window", 1024, "reorder window (packets)")
-	timeoutMs := fs.Int("timeout-ms", 10, "reorder timeout in ms")
+	window := fs.Int("window", 16, "reorder window (batches)")
+	timeoutUs := fs.Int("timeout-us", 1000, "reorder timeout in microseconds")
+	wBucket := fs.Int("writer-bucket", 16, "writer bucket size (sub-slices)")
+	wTimeoutUs := fs.Int("writer-timeout-us", 1000, "writer timeout in microseconds")
 	payload := fs.Int("payload", 1400, "inner payload bytes per packet")
 	duration := fs.Duration("duration", 30*time.Second, "auto-stop after this; 0 = run until SIGINT")
 	_ = fs.Parse(args)
 
 	fakes, ws := makeFakeWriters(*writers)
 
-	pipe := newReorderPipe(*window, time.Duration(*timeoutMs)*time.Millisecond, ws, silentLogger())
+	pipe := newReorderPipe(
+		*window,
+		time.Duration(*timeoutUs)*time.Microsecond,
+		*wBucket,
+		time.Duration(*wTimeoutUs)*time.Microsecond,
+		ws,
+		silentLogger(),
+	)
 	defer pipe.close()
 
 	stop := make(chan struct{})

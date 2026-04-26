@@ -14,6 +14,7 @@ import (
 const (
 	cIFF_TUN         = 0x0001
 	cIFF_NO_PI       = 0x1000
+	cIFF_MULTI_QUEUE = 0x0100
 	cIFNAMSIZ        = 16
 	cTUNSETIFF       = 0x400454ca
 )
@@ -24,20 +25,25 @@ type ifReq struct {
 	pad   [22]byte
 }
 
-// TUN encapsulates a /dev/net/tun device plus the netlink-managed
-// interface state (link up + IP/route). MVP: single-queue, no GSO.
+// TUN encapsulates one /dev/net/tun queue + the netlink-managed
+// interface state (link up + IP/route). For multi-queue, the first
+// TUN owns the netlink config; subsequent queues just attach more
+// fds to the same dev.
 type TUN struct {
 	dev *os.File
 	mtu int
 }
 
-func newTUN(dev string, mtu int) (*os.File, error) {
+func openTUNFD(dev string, multi bool) (*os.File, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
 	}
 	var req ifReq
 	req.Flags = cIFF_TUN | cIFF_NO_PI
+	if multi {
+		req.Flags |= cIFF_MULTI_QUEUE
+	}
 	copy(req.Name[:], dev)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cTUNSETIFF), uintptr(unsafe.Pointer(&req))); errno != 0 {
 		_ = unix.Close(fd)
@@ -46,14 +52,16 @@ func newTUN(dev string, mtu int) (*os.File, error) {
 	return os.NewFile(uintptr(fd), "/dev/net/tun"), nil
 }
 
-// OpenTUN opens the TUN device, sets MTU, assigns the VIP, brings the
-// link up. The VIP prefix length doubles as the on-link route.
+// OpenTUN opens the primary TUN fd, sets MTU, assigns the VIP, brings
+// the link up. The VIP prefix length doubles as the on-link route.
+// Always opens with IFF_MULTI_QUEUE so additional queues can attach
+// later via AttachTUN.
 func OpenTUN(dev string, mtu int, vip string) (*TUN, error) {
 	parsedAddr, err := netlink.ParseAddr(vip)
 	if err != nil {
 		return nil, fmt.Errorf("parse vip %q: %w", vip, err)
 	}
-	f, err := newTUN(dev, mtu)
+	f, err := openTUNFD(dev, true)
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +81,17 @@ func OpenTUN(dev string, mtu int, vip string) (*TUN, error) {
 	if err := netlink.LinkSetUp(link); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("LinkSetUp %s: %w", dev, err)
+	}
+	return &TUN{dev: f, mtu: mtu}, nil
+}
+
+// AttachTUN opens an additional queue on an already-up TUN device.
+// No netlink touches — just another fd attached to the same dev with
+// IFF_MULTI_QUEUE set.
+func AttachTUN(dev string, mtu int) (*TUN, error) {
+	f, err := openTUNFD(dev, true)
+	if err != nil {
+		return nil, err
 	}
 	return &TUN{dev: f, mtu: mtu}, nil
 }

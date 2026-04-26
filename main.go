@@ -13,42 +13,41 @@ func main() {
 	configPath := flag.String("config", "/etc/gofra/config.json", "path to JSON config")
 	flag.Parse()
 
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	Try(func() {
+		cfg := loadConfig(*configPath)
+		logger := newLogger(cfg.LogLevel)
+
+		logger.Info("gofra starting",
+			"listen_port", cfg.ListenPort,
+			"underlay", cfg.Underlay,
+			"vip", cfg.TunVIP,
+			"peers", len(cfg.PeerByVIP),
+		)
+
+		g := newGofra(cfg, logger)
+
+		go signalLoop(logger)
+
+		Throw(g.Run())
+	}).Catch(func(e *Exception) {
+		fmt.Fprintln(os.Stderr, e)
 		os.Exit(1)
-	}
+	})
+}
 
-	logger := newLogger(cfg.LogLevel)
-	logger.Info("gofra starting",
-		"listen_port", cfg.ListenPort,
-		"underlay", cfg.Underlay,
-		"vip", cfg.TunVIP,
-		"peers", len(cfg.PeerByVIP),
-	)
+func signalLoop(logger *slog.Logger) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 
-	g, err := newGofra(cfg, logger)
-	if err != nil {
-		logger.Error("init failed", "err", err)
-		os.Exit(1)
-	}
+	sig := <-ch
 
-	go func() {
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-		sig := <-ch
-		logger.Info("signal received, shutting down", "sig", sig)
-		os.Exit(0)
-	}()
-
-	if err := g.Run(); err != nil {
-		logger.Error("data plane stopped", "err", err)
-		os.Exit(1)
-	}
+	logger.Info("signal received, shutting down", "sig", sig)
+	os.Exit(0)
 }
 
 func newLogger(level string) *slog.Logger {
 	var lvl slog.Level
+
 	switch level {
 	case "debug":
 		lvl = slog.LevelDebug
@@ -61,5 +60,6 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
+
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 }

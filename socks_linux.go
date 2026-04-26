@@ -14,9 +14,13 @@ import (
 
 const (
 	udpRecvBatch = 64
-	udpRecvBuf   = 8 << 20
-	udpSendBuf   = 8 << 20
-	udpMTU       = 65536
+	// 16 MiB matches lab's etc/sysctl rmem_max/wmem_max ceiling.
+	// SO_*BUFFORCE bypasses the limit but staying under the policy
+	// cap means we don't fight the kernel; smaller buffers were
+	// triggering RcvbufErrors at 4-NIC stripe burst rates.
+	udpRecvBuf = 16 << 20
+	udpSendBuf = 16 << 20
+	udpMTU     = 65536
 )
 
 // openUDPSocket binds a UDP socket on (src, port), pins egress to

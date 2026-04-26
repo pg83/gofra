@@ -1,258 +1,194 @@
 package main
 
 import (
-	"sync"
+	"log/slog"
+	"sort"
 	"time"
 )
 
-// reorderRing absorbs out-of-order delivery from the (srcs × dsts)
-// stripe so kernel TCP on the receiver never sees it. One ring per
-// peer. Each wire packet carries a 4-byte monotonic seq prepended
-// by the sender; the ring delivers packets to the TUN strictly in
-// seq order, holding gaps for up to `timeout` before skipping
-// past them (and letting the inner-protocol retransmit machinery
-// — if any — recover the lost data the slow way).
+// reorderPipe is the per-peer pipeline that turns the unordered
+// stripe-output coming from N udpReaders back into something kernel
+// TCP can chew on without spurious retransmits, while keeping
+// throughput high.
 //
-// Sliding window: `base` is the next seq we expect. Slot
-// (seq - base) % len(slots) holds the corresponding packet. New
-// arrivals advance base as far as consecutive valid slots allow;
-// per-arrival timeout-check skips lone gaps when their oldest
-// pending neighbour has been waiting too long. A periodic ticker
-// makes timeout-flushes happen even without new arrivals.
+// Shape:
 //
-// Concurrency: 4 udpReader goroutines call put() from different
-// sockets but the same peer may be served by any of them. One
-// mutex protects the ring; the critical section is small (a copy
-// + a few atomic field updates).
-type reorderRing struct {
-	mu     sync.Mutex
-	base   uint32
-	slots  []reorderSlot
-	tun    *TUN
-	logger interface {
-		Debug(string, ...any)
-		Warn(string, ...any)
-	}
-
-	timeout time.Duration
-
-	// gapStartedAt timestamps the first non-base insertion that
-	// extended the in-window range. Cleared when base advances
-	// past every pending slot. Used to age out stuck gaps.
-	gapStartedAt time.Time
-
-	// stop signals the timeout-flush goroutine to exit.
+//   N udpReader goroutines  (one per src socket)
+//      │   batch up to batchSize packets, ship to peer's `in`
+//      ▼   (idle batches flushed by their owning udpReader)
+//   1 reorder goroutine per peer
+//      │   accumulate batches until `window` items or `timeout`,
+//      │   THEN bucket items by seq % numWriters into M sub-slices
+//      │   (no sort here — that's the writers' job),
+//      │   ship each sub-slice as one channel send.
+//      ▼
+//   M writer goroutines, one per TUN queue
+//      │   sort own sub-slice (~window/M items, O(n log n) on a
+//      │   tiny n), tun.Write each in seq order.
+//
+// Why distribute-then-sort instead of sort-then-distribute:
+// parallelises the sort over M cores. Each writer sorts only its
+// share. The whole pipeline is lock-free outside channel ops.
+//
+// Cross-queue ordering at kernel softirq is best-effort, but each
+// queue's input is monotone by seq (after writer sort), and writers
+// progress roughly in lock-step, so the kernel-side reorder
+// distance is microseconds — well within tcp_reordering's
+// tolerance.
+type reorderPipe struct {
+	in   chan *batch
+	outs []chan []rxItem
 	stop chan struct{}
+
+	window  int
+	timeout time.Duration
+	logger  *slog.Logger
 }
 
-type reorderSlot struct {
-	// payload holds [virtio_net_hdr 10 zero bytes][inner ip pkt],
-	// already laid out for tun.Write(payload). Nil/zero-length
-	// when the slot is unused.
-	payload []byte
-	valid   bool
-	arrived time.Time
-}
+const (
+	batchSize = 64
+	// batchFlushPeriod bounds how long a partly-filled batch sits
+	// in a udpReader before being shipped to the reorder
+	// goroutine. Short enough to not noticeably add to the
+	// user-visible reorder latency budget.
+	batchFlushPeriod = 1 * time.Millisecond
+)
 
-func newReorderRing(window int, timeout time.Duration, tun *TUN, logger interface {
-	Debug(string, ...any)
-	Warn(string, ...any)
-}) *reorderRing {
-	r := &reorderRing{
-		slots:   make([]reorderSlot, window),
-		tun:     tun,
-		logger:  logger,
-		timeout: timeout,
-		stop:    make(chan struct{}),
-	}
-
-	go r.timeoutLoop()
-
-	return r
-}
-
-// put inserts the packet at its seq position and advances the base
-// as far as ready / aged-out slots allow.
-func (r *reorderRing) put(seq uint32, innerPkt []byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	now := time.Now()
-	winLen := uint32(len(r.slots))
-
-	// First-ever arrival: align base on this seq so we don't wait
-	// forever for "missing" packets that never existed.
-	if r.base == 0 && !r.anyValidLocked() {
-		r.base = seq
-	}
-
-	diff := seq - r.base
-
-	if diff >= winLen {
-		// Either a stale duplicate from way back (diff is huge
-		// because of unsigned wrap) or a jump too far ahead. We
-		// distinguish via the high bit: if diff is closer to 2^32
-		// than to 0, it's a late packet — drop. Otherwise force
-		// the window forward to fit the new seq.
-		if diff > (1<<31) {
-			return
-		}
-
-		// Slide the window so the new seq falls at the very edge.
-		skip := diff - winLen + 1
-
-		for i := uint32(0); i < skip; i++ {
-			r.advanceLocked()
-		}
-
-		diff = seq - r.base
-	}
-
-	idx := (r.base + diff) % winLen
-
-	if r.slots[idx].valid {
-		// Duplicate (or wrap collision after force-advance). Drop.
-		return
-	}
-
-	hdrLen := virtioNetHdrLen
-	need := hdrLen + len(innerPkt)
-
-	if cap(r.slots[idx].payload) < need {
-		r.slots[idx].payload = make([]byte, need)
-	} else {
-		r.slots[idx].payload = r.slots[idx].payload[:need]
-
-		for i := 0; i < hdrLen; i++ {
-			r.slots[idx].payload[i] = 0
-		}
-	}
-
-	copy(r.slots[idx].payload[hdrLen:], innerPkt)
-
-	r.slots[idx].valid = true
-	r.slots[idx].arrived = now
-
-	if diff > 0 && r.gapStartedAt.IsZero() {
-		r.gapStartedAt = now
-	}
-
-	r.tryAdvanceLocked(now)
-}
-
-// tryAdvanceLocked walks the ring forward as long as either:
-//   - the slot at base is valid, or
-//   - there's a pending packet behind a gap whose age exceeds
-//     the configured timeout.
+// rxItem carries one received packet from udpReader → reorder →
+// writer. payload is owned by the item (a caller-allocated copy);
+// recvmmsg buffers are reused so we can't keep references to them.
 //
-// When the second condition fires we skip the gap (advance past
-// it) and try again. Caller must hold r.mu.
-func (r *reorderRing) tryAdvanceLocked(now time.Time) {
-	winLen := uint32(len(r.slots))
+// payload layout: [10 zero virtio_net_hdr bytes][inner ip packet],
+// pre-formatted so the writer can tun.Write(payload) directly.
+type rxItem struct {
+	seq     uint32
+	payload []byte
+}
 
-	for {
-		idx := r.base % winLen
+// batch groups up to batchSize rxItems for one channel send.
+type batch struct {
+	items []rxItem
+}
 
-		if r.slots[idx].valid {
-			r.flushSlotLocked(idx)
-			r.base++
+func newReorderPipe(window int, timeout time.Duration, tuns []*TUN, logger *slog.Logger) *reorderPipe {
+	p := &reorderPipe{
+		in:      make(chan *batch, 64),
+		outs:    make([]chan []rxItem, len(tuns)),
+		stop:    make(chan struct{}),
+		window:  window,
+		timeout: timeout,
+		logger:  logger,
+	}
 
-			if !r.anyValidLocked() {
-				r.gapStartedAt = time.Time{}
-			}
+	for i := range p.outs {
+		p.outs[i] = make(chan []rxItem, 8)
+	}
 
-			continue
-		}
+	go p.reorderLoop()
 
-		if r.gapStartedAt.IsZero() || now.Sub(r.gapStartedAt) < r.timeout {
+	for i, t := range tuns {
+		go p.writerLoop(p.outs[i], t)
+	}
+
+	return p
+}
+
+// reorderLoop drains incoming batches into a flat accumulator,
+// distributes the contents into M sub-slices keyed by seq % M on
+// either threshold or timeout, then ships each sub-slice to the
+// matching writer. Writers sort.
+func (p *reorderPipe) reorderLoop() {
+	accum := make([]rxItem, 0, p.window*2)
+
+	timer := time.NewTimer(p.timeout)
+	defer timer.Stop()
+
+	m := len(p.outs)
+
+	flush := func() {
+		if len(accum) == 0 {
 			return
 		}
 
-		// Gap aged out — skip it.
-		r.base++
+		buckets := make([][]rxItem, m)
 
-		// New gapStartedAt = oldest still-pending arrival, or
-		// zero if nothing pending now.
-		r.gapStartedAt = r.oldestPendingLocked()
-	}
-}
-
-// advanceLocked unconditionally moves base by one, flushing the
-// slot at base if it happens to be valid.
-func (r *reorderRing) advanceLocked() {
-	idx := r.base % uint32(len(r.slots))
-
-	if r.slots[idx].valid {
-		r.flushSlotLocked(idx)
-	}
-
-	r.base++
-}
-
-// flushSlotLocked writes the slot's payload to the TUN and marks
-// it free.
-func (r *reorderRing) flushSlotLocked(idx uint32) {
-	s := &r.slots[idx]
-
-	if _, err := r.tun.Write(s.payload); err != nil {
-		r.logger.Warn("reorder: tun.Write failed", "err", err)
-	}
-
-	s.valid = false
-	s.payload = s.payload[:0]
-}
-
-func (r *reorderRing) anyValidLocked() bool {
-	for i := range r.slots {
-		if r.slots[i].valid {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (r *reorderRing) oldestPendingLocked() time.Time {
-	var oldest time.Time
-
-	for i := range r.slots {
-		if !r.slots[i].valid {
-			continue
+		for i := range buckets {
+			buckets[i] = make([]rxItem, 0, len(accum)/m+1)
 		}
 
-		if oldest.IsZero() || r.slots[i].arrived.Before(oldest) {
-			oldest = r.slots[i].arrived
+		for _, item := range accum {
+			idx := int(item.seq % uint32(m))
+			buckets[idx] = append(buckets[idx], item)
 		}
+
+		for i, b := range buckets {
+			if len(b) > 0 {
+				p.outs[i] <- b
+			}
+		}
+
+		accum = accum[:0]
 	}
 
-	return oldest
-}
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 
-// timeoutLoop force-advances the ring on a tick so timeouts fire
-// even when no fresh packets are arriving. Tick at timeout/4 so we
-// stay close to the configured upper bound on hold time.
-func (r *reorderRing) timeoutLoop() {
-	period := r.timeout / 4
-	if period <= 0 {
-		period = time.Millisecond
+		timer.Reset(p.timeout)
 	}
-
-	t := time.NewTicker(period)
-	defer t.Stop()
 
 	for {
 		select {
-		case <-r.stop:
+		case <-p.stop:
+			flush()
+
+			for _, ch := range p.outs {
+				close(ch)
+			}
+
 			return
 
-		case now := <-t.C:
-			r.mu.Lock()
-			r.tryAdvanceLocked(now)
-			r.mu.Unlock()
+		case b, ok := <-p.in:
+			if !ok {
+				return
+			}
+
+			accum = append(accum, b.items...)
+
+			if len(accum) >= p.window {
+				flush()
+				resetTimer()
+			}
+
+		case <-timer.C:
+			flush()
+			timer.Reset(p.timeout)
 		}
 	}
 }
 
-func (r *reorderRing) close() {
-	close(r.stop)
+// writerLoop receives one sub-slice per dispatch, sorts it by seq
+// (O(n log n) on n ≈ window/M, trivial), then tun.Write's each item
+// in order. Each writer owns one TUN queue; in-queue order is
+// preserved by kernel softirq.
+func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun *TUN) {
+	for sub := range in {
+		sort.Slice(sub, func(i, j int) bool {
+			return sub[i].seq < sub[j].seq
+		})
+
+		for _, item := range sub {
+			if _, err := tun.Write(item.payload); err != nil {
+				p.logger.Warn("reorder writer: tun.Write failed", "err", err)
+			}
+		}
+	}
+}
+
+func (p *reorderPipe) close() {
+	close(p.stop)
 }

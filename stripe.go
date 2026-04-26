@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -20,19 +21,19 @@ const (
 
 // peer is the dispatch entry for one remote VIP. Holds the underlay
 // dst endpoints to stripe over, the per-peer RR counter, the
-// per-peer outbound seq counter, and the per-peer reorder ring used
-// on the inbound side.
+// per-peer outbound seq counter, and the per-peer reorder pipeline
+// used on the inbound side.
 type peer struct {
 	dsts  []netip.AddrPort
 	rr    atomic.Uint64
 	txSeq atomic.Uint32
-	rx    *reorderRing
+	rx    *reorderPipe
 }
 
 // Gofra is the data plane: N src sockets + peer table + N TUN queues.
 // One tunReader goroutine per TUN queue pumps inner packets out via
 // the stripe; one udpReader goroutine per UDP socket pumps inbound
-// packets into the matching peer's reorder ring.
+// packets into the matching peer's reorder pipeline.
 type Gofra struct {
 	socks  []*net.UDPConn
 	peers  map[netip.Addr]*peer
@@ -69,7 +70,6 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 	peers := make(map[netip.Addr]*peer, len(cfg.PeerByVIP))
 	peerByDst := make(map[netip.AddrPort]*peer)
 
-	pi := 0
 	for vip, ips := range cfg.PeerByVIP {
 		dsts := make([]netip.AddrPort, len(ips))
 
@@ -77,12 +77,10 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 			dsts[i] = netip.AddrPortFrom(ip, cfg.ListenPort)
 		}
 
-		// Each peer's reorder output is written into one fixed
-		// TUN queue (peer-id-stable round-robin) so kernel TCP
-		// affinity isn't churned by us.
-		ring := newReorderRing(cfg.ReorderWindow, cfg.ReorderTimeout, tuns[pi%len(tuns)], logger)
-
-		p := &peer{dsts: dsts, rx: ring}
+		p := &peer{
+			dsts: dsts,
+			rx:   newReorderPipe(cfg.ReorderWindow, cfg.ReorderTimeout, tuns, logger),
+		}
 		peers[vip] = p
 
 		for _, d := range dsts {
@@ -90,7 +88,6 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 		}
 
 		logger.Info("peer registered", "vip", vip, "dsts", dsts, "reorder_window", cfg.ReorderWindow, "reorder_timeout", cfg.ReorderTimeout)
-		pi++
 	}
 
 	return &Gofra{
@@ -176,25 +173,16 @@ func (g *Gofra) Run() error {
 // one of N queues, so multiple TCP flows can be processed in
 // parallel by N independent goroutines.
 //
-// The TUN was opened with IFF_VNET_HDR + TUN_F_CSUM | TUN_F_TSO4
-// so the kernel hands us up to ~64 KB super-segments with a 10-byte
-// virtio_net_hdr prefix. For GSO_TCPV4 we segment into MTU-sized
-// real packets in user-space; non-GSO packets pass through as-is
-// (just stripped of their virtio_net_hdr prefix).
-//
 // Every wire packet gets a 4-byte monotonic seq prepended for the
-// receiver's reorder buffer to use.
+// receiver's reorder pipeline.
 func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 	return Try(func() {
 		const maxGSOSegs = 64
 
 		mtu := t.MTU()
 
-		// 64 KB pseudo-segment + virtio_net_hdr + slack.
 		buf := make([]byte, virtioNetHdrLen+65535+128)
 
-		// Per-segment output buffers from gsoSplit (no seq prefix
-		// — seq is added in send()).
 		segBufs := make([][]byte, maxGSOSegs)
 		segSizes := make([]int, maxGSOSegs)
 
@@ -202,7 +190,6 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 			segBufs[i] = make([]byte, mtu+128)
 		}
 
-		// One scratch buffer for the [seq][payload] wire format.
 		txWire := make([]byte, wireSeqLen+mtu+128)
 
 		send := g.makeSender(txWire)
@@ -288,15 +275,31 @@ func (g *Gofra) makeSender(txWire []byte) func([]byte) {
 	}
 }
 
-// udpReader pumps inbound UDP packets into the appropriate peer's
-// reorder ring. recvmmsg(batch=N) drains the kernel; the per-peer
-// dispatch keys on the source address via sockaddr_in extracted
-// from each msghdr.
+// udpReader pumps inbound UDP packets through per-peer batches into
+// the reorder pipeline. recvmmsg drains the kernel; per-peer
+// pending batches are flushed when full (batchSize) or when the
+// flush-period ticker fires (so a quiet peer doesn't sit on a
+// half-filled batch indefinitely).
 func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 	return Try(func() {
 		rc := Throw2(s.SyscallConn())
 
 		msgs, buffers, names := prepareRawMessages(g.cfg.UdpRecvBatch)
+
+		// Per-peer pending batch. Keyed by *peer pointer.
+		pending := make(map[*peer]*batch)
+
+		flushTicker := time.NewTicker(batchFlushPeriod)
+		defer flushTicker.Stop()
+
+		flushAll := func() {
+			for p, b := range pending {
+				if b != nil && len(b.items) > 0 {
+					p.rx.in <- b
+					delete(pending, p)
+				}
+			}
+		}
 
 		var (
 			n    int
@@ -310,6 +313,15 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 		}
 
 		for {
+			// Non-blocking ticker check between recvmmsg calls
+			// to keep idle batches from sitting too long.
+			select {
+			case <-flushTicker.C:
+				flushAll()
+
+			default:
+			}
+
 			Throw(rc.Read(reader))
 
 			if !done {
@@ -320,12 +332,11 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 				wireLen := int(msgs[i].Len)
 
 				if wireLen < wireSeqLen+20 {
-					// too short to be a valid [seq][ipv4] frame
 					continue
 				}
 
 				seq := binary.BigEndian.Uint32(buffers[i][:wireSeqLen])
-				payload := buffers[i][wireSeqLen:wireLen]
+				inner := buffers[i][wireSeqLen:wireLen]
 
 				from := fromV4(names[i])
 
@@ -336,7 +347,25 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 					continue
 				}
 
-				p.rx.put(seq, payload)
+				// Allocate item with the virtio prefix already
+				// in place (zero) and the inner payload copied
+				// in. The writer can tun.Write(item.payload)
+				// directly — no further copies on the hot path.
+				payload := make([]byte, virtioNetHdrLen+len(inner))
+				copy(payload[virtioNetHdrLen:], inner)
+
+				b, ok := pending[p]
+				if !ok {
+					b = &batch{items: make([]rxItem, 0, batchSize)}
+					pending[p] = b
+				}
+
+				b.items = append(b.items, rxItem{seq: seq, payload: payload})
+
+				if len(b.items) >= batchSize {
+					p.rx.in <- b
+					delete(pending, p)
+				}
 			}
 		}
 	})

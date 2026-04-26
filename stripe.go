@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"log/slog"
 	"net"
@@ -11,23 +12,36 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// peer is the dispatch entry for one remote VIP — N underlay AddrPort
-// endpoints to stripe over, plus a per-peer round-robin counter that
-// walks the full (srcs × dsts) matrix.
+const (
+	// wireSeqLen is the 4-byte monotonic seq prepended to every
+	// outgoing UDP datagram. Receiver strips it before delivery.
+	wireSeqLen = 4
+)
+
+// peer is the dispatch entry for one remote VIP. Holds the underlay
+// dst endpoints to stripe over, the per-peer RR counter, the
+// per-peer outbound seq counter, and the per-peer reorder ring used
+// on the inbound side.
 type peer struct {
-	dsts []netip.AddrPort
-	rr   atomic.Uint64
+	dsts  []netip.AddrPort
+	rr    atomic.Uint64
+	txSeq atomic.Uint32
+	rx    *reorderRing
 }
 
 // Gofra is the data plane: N src sockets + peer table + N TUN queues.
 // One tunReader goroutine per TUN queue pumps inner packets out via
 // the stripe; one udpReader goroutine per UDP socket pumps inbound
-// packets straight into a TUN queue.
+// packets into the matching peer's reorder ring.
 type Gofra struct {
 	socks  []*net.UDPConn
 	peers  map[netip.Addr]*peer
-	tuns   []*TUN
-	logger *slog.Logger
+	// peerByDst lets udpReader resolve a from-addr (one of any
+	// peer's dsts) to the owning peer in O(1).
+	peerByDst map[netip.AddrPort]*peer
+	tuns      []*TUN
+	cfg       *parsedConfig
+	logger    *slog.Logger
 }
 
 func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
@@ -45,15 +59,17 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 
 	for _, src := range cfg.Underlay {
 		ifname := ifaceForAddr(src)
-		uc := openUDPSocket(src, int(cfg.ListenPort), ifname)
+		uc := openUDPSocket(src, int(cfg.ListenPort), ifname, cfg.UdpRecvBuf, cfg.UdpSendBuf)
 
-		logger.Info("udp ready", "src", src, "iface", ifname, "port", cfg.ListenPort)
+		logger.Info("udp ready", "src", src, "iface", ifname, "port", cfg.ListenPort, "rcvbuf", cfg.UdpRecvBuf, "sndbuf", cfg.UdpSendBuf)
 
 		socks = append(socks, uc)
 	}
 
 	peers := make(map[netip.Addr]*peer, len(cfg.PeerByVIP))
+	peerByDst := make(map[netip.AddrPort]*peer)
 
+	pi := 0
 	for vip, ips := range cfg.PeerByVIP {
 		dsts := make([]netip.AddrPort, len(ips))
 
@@ -61,15 +77,29 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 			dsts[i] = netip.AddrPortFrom(ip, cfg.ListenPort)
 		}
 
-		peers[vip] = &peer{dsts: dsts}
-		logger.Info("peer registered", "vip", vip, "dsts", dsts)
+		// Each peer's reorder output is written into one fixed
+		// TUN queue (peer-id-stable round-robin) so kernel TCP
+		// affinity isn't churned by us.
+		ring := newReorderRing(cfg.ReorderWindow, cfg.ReorderTimeout, tuns[pi%len(tuns)], logger)
+
+		p := &peer{dsts: dsts, rx: ring}
+		peers[vip] = p
+
+		for _, d := range dsts {
+			peerByDst[d] = p
+		}
+
+		logger.Info("peer registered", "vip", vip, "dsts", dsts, "reorder_window", cfg.ReorderWindow, "reorder_timeout", cfg.ReorderTimeout)
+		pi++
 	}
 
 	return &Gofra{
-		socks:  socks,
-		peers:  peers,
-		tuns:   tuns,
-		logger: logger,
+		socks:     socks,
+		peers:     peers,
+		peerByDst: peerByDst,
+		tuns:      tuns,
+		cfg:       cfg,
+		logger:    logger,
 	}
 }
 
@@ -104,6 +134,11 @@ func (g *Gofra) Run() error {
 
 		if firstErr == nil {
 			firstErr = e
+
+			for _, p := range g.peers {
+				p.rx.close()
+			}
+
 			closeAllTUNs(g.tuns)
 			closeAllSocks(g.socks)
 		}
@@ -146,6 +181,9 @@ func (g *Gofra) Run() error {
 // virtio_net_hdr prefix. For GSO_TCPV4 we segment into MTU-sized
 // real packets in user-space; non-GSO packets pass through as-is
 // (just stripped of their virtio_net_hdr prefix).
+//
+// Every wire packet gets a 4-byte monotonic seq prepended for the
+// receiver's reorder buffer to use.
 func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 	return Try(func() {
 		const maxGSOSegs = 64
@@ -155,6 +193,8 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 		// 64 KB pseudo-segment + virtio_net_hdr + slack.
 		buf := make([]byte, virtioNetHdrLen+65535+128)
 
+		// Per-segment output buffers from gsoSplit (no seq prefix
+		// — seq is added in send()).
 		segBufs := make([][]byte, maxGSOSegs)
 		segSizes := make([]int, maxGSOSegs)
 
@@ -162,7 +202,10 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 			segBufs[i] = make([]byte, mtu+128)
 		}
 
-		send := g.makeSender()
+		// One scratch buffer for the [seq][payload] wire format.
+		txWire := make([]byte, wireSeqLen+mtu+128)
+
+		send := g.makeSender(txWire)
 
 		for {
 			n := Throw2(t.Read(buf))
@@ -207,10 +250,11 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 	})
 }
 
-// makeSender returns the per-tunReader stripe-and-send closure.
-// Filter-style: a single bad packet logs a warning and is skipped,
-// not propagated.
-func (g *Gofra) makeSender() func([]byte) {
+// makeSender returns the per-tunReader stripe-and-send closure. It
+// reuses the caller-provided txWire scratch buffer to assemble
+// [seq 4B][payload] in one piece — single WriteToUDPAddrPort, one
+// memcpy of the payload.
+func (g *Gofra) makeSender(txWire []byte) func([]byte) {
 	return func(payload []byte) {
 		if len(payload) < 20 {
 			return
@@ -230,7 +274,13 @@ func (g *Gofra) makeSender() func([]byte) {
 		srcIdx := int(c % uint64(len(g.socks)))
 		dstIdx := int((c / uint64(len(g.socks))) % uint64(len(p.dsts)))
 
-		if _, err := g.socks[srcIdx].WriteToUDPAddrPort(payload, p.dsts[dstIdx]); err != nil {
+		seq := p.txSeq.Add(1) - 1
+
+		binary.BigEndian.PutUint32(txWire[:wireSeqLen], seq)
+		copy(txWire[wireSeqLen:], payload)
+		wire := txWire[:wireSeqLen+len(payload)]
+
+		if _, err := g.socks[srcIdx].WriteToUDPAddrPort(wire, p.dsts[dstIdx]); err != nil {
 			if !errors.Is(err, net.ErrClosed) {
 				g.logger.Warn("udp write failed", "src", srcIdx, "dst", p.dsts[dstIdx], "err", err)
 			}
@@ -238,21 +288,15 @@ func (g *Gofra) makeSender() func([]byte) {
 	}
 }
 
-// udpReader pumps inbound UDP packets straight into a TUN queue.
-// Uses recvmmsg(batch=64) — one syscall per batch instead of one
-// per packet. Each udpReader writes to its corresponding TUN queue
-// (round-robined by udpReader index); the kernel doesn't care which
-// queue we use for the inbound write.
+// udpReader pumps inbound UDP packets into the appropriate peer's
+// reorder ring. recvmmsg(batch=N) drains the kernel; the per-peer
+// dispatch keys on the source address via sockaddr_in extracted
+// from each msghdr.
 func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 	return Try(func() {
 		rc := Throw2(s.SyscallConn())
 
-		// Reserve virtio_net_hdr at the start of each buffer so we can
-		// tun.Write(buffer[:virtioNetHdrLen+pktLen]) without an extra
-		// copy. The header bytes are zero-initialised at allocation —
-		// no GSO, no checksum-offload hints.
-		msgs, buffers := prepareRawMessages(udpRecvBatch, virtioNetHdrLen)
-		tun := g.tuns[idx%len(g.tuns)]
+		msgs, buffers, names := prepareRawMessages(g.cfg.UdpRecvBatch)
 
 		var (
 			n    int
@@ -273,15 +317,26 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 			}
 
 			for i := 0; i < n; i++ {
-				pktLen := int(msgs[i].Len)
+				wireLen := int(msgs[i].Len)
 
-				if _, err := tun.Write(buffers[i][:virtioNetHdrLen+pktLen]); err != nil {
-					if errors.Is(err, net.ErrClosed) {
-						Throw(err)
-					}
-
-					g.logger.Warn("tun write failed", "src", idx, "err", err)
+				if wireLen < wireSeqLen+20 {
+					// too short to be a valid [seq][ipv4] frame
+					continue
 				}
+
+				seq := binary.BigEndian.Uint32(buffers[i][:wireSeqLen])
+				payload := buffers[i][wireSeqLen:wireLen]
+
+				from := fromV4(names[i])
+
+				p, ok := g.peerByDst[from]
+				if !ok {
+					g.logger.Debug("udp: drop packet from unknown peer src", "from", from)
+
+					continue
+				}
+
+				p.rx.put(seq, payload)
 			}
 		}
 	})

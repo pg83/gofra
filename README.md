@@ -38,9 +38,21 @@ authentication, no roaming. If you want any of that, run nebula.
   "peers": {
     "192.168.102.17": ["10.0.0.68", "10.0.0.69", "10.0.0.70", "10.0.0.71"],
     "192.168.102.18": ["10.0.0.72", "10.0.0.73", "10.0.0.74", "10.0.0.75"]
+  },
+  "udp": {
+    "recv_batch": 64,
+    "recv_buf": 16777216,
+    "send_buf": 16777216
+  },
+  "reorder": {
+    "window": 1024,
+    "timeout_ms": 10
   }
 }
 ```
+
+The `udp` and `reorder` blocks are optional; defaults shown above
+apply when omitted.
 
 * `me.underlay` — local IPs to bind on. Each must already be
   configured on a NIC.

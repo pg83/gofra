@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/netip"
 	"os"
+	"time"
 )
 
 type tunConfig struct {
@@ -17,21 +18,39 @@ type meConfig struct {
 	Tun      tunConfig `json:"tun"`
 }
 
+type udpConfig struct {
+	RecvBatch int `json:"recv_batch"`
+	RecvBuf   int `json:"recv_buf"`
+	SendBuf   int `json:"send_buf"`
+}
+
+type reorderConfig struct {
+	Window    int `json:"window"`
+	TimeoutMs int `json:"timeout_ms"`
+}
+
 type Config struct {
 	LogLevel   string              `json:"log_level"`
 	ListenPort int                 `json:"listen_port"`
 	Me         meConfig            `json:"me"`
 	Peers      map[string][]string `json:"peers"`
+	Udp        udpConfig           `json:"udp"`
+	Reorder    reorderConfig       `json:"reorder"`
 }
 
 type parsedConfig struct {
-	LogLevel   string
-	ListenPort uint16
-	Underlay   []netip.Addr
-	TunDev     string
-	TunMTU     int
-	TunVIP     netip.Prefix
-	PeerByVIP  map[netip.Addr][]netip.Addr
+	LogLevel       string
+	ListenPort     uint16
+	Underlay       []netip.Addr
+	TunDev         string
+	TunMTU         int
+	TunVIP         netip.Prefix
+	PeerByVIP      map[netip.Addr][]netip.Addr
+	UdpRecvBatch   int
+	UdpRecvBuf     int
+	UdpSendBuf     int
+	ReorderWindow  int
+	ReorderTimeout time.Duration
 }
 
 func loadConfig(path string) *parsedConfig {
@@ -99,13 +118,43 @@ func loadConfig(path string) *parsedConfig {
 		logLevel = "info"
 	}
 
+	udpRecvBatch := raw.Udp.RecvBatch
+	if udpRecvBatch <= 0 {
+		udpRecvBatch = 64
+	}
+
+	udpRecvBuf := raw.Udp.RecvBuf
+	if udpRecvBuf <= 0 {
+		udpRecvBuf = 16 << 20
+	}
+
+	udpSendBuf := raw.Udp.SendBuf
+	if udpSendBuf <= 0 {
+		udpSendBuf = 16 << 20
+	}
+
+	reorderWindow := raw.Reorder.Window
+	if reorderWindow <= 0 {
+		reorderWindow = 1024
+	}
+
+	reorderTimeoutMs := raw.Reorder.TimeoutMs
+	if reorderTimeoutMs <= 0 {
+		reorderTimeoutMs = 10
+	}
+
 	return &parsedConfig{
-		LogLevel:   logLevel,
-		ListenPort: uint16(raw.ListenPort),
-		Underlay:   underlay,
-		TunDev:     raw.Me.Tun.Dev,
-		TunMTU:     raw.Me.Tun.MTU,
-		TunVIP:     vip,
-		PeerByVIP:  peers,
+		LogLevel:       logLevel,
+		ListenPort:     uint16(raw.ListenPort),
+		Underlay:       underlay,
+		TunDev:         raw.Me.Tun.Dev,
+		TunMTU:         raw.Me.Tun.MTU,
+		TunVIP:         vip,
+		PeerByVIP:      peers,
+		UdpRecvBatch:   udpRecvBatch,
+		UdpRecvBuf:     udpRecvBuf,
+		UdpSendBuf:     udpSendBuf,
+		ReorderWindow:  reorderWindow,
+		ReorderTimeout: time.Duration(reorderTimeoutMs) * time.Millisecond,
 	}
 }

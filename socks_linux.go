@@ -136,17 +136,21 @@ type rawMessage struct {
 }
 
 // prepareRawMessages allocates the buffers / msghdr scaffolding for
-// a recvmmsg batch of size n. We don't need sockaddr_in (the inner
-// IP packet self-describes the source), so msghdr.Name is left nil.
-func prepareRawMessages(n int) ([]rawMessage, [][]byte) {
+// a recvmmsg batch of size n. Each buffer reserves `prefix` bytes at
+// the front (zero-filled) and recvmmsg writes the actual packet at
+// offset prefix; the caller can then tun.Write(buffer[:prefix+len])
+// directly without an extra copy. We don't need sockaddr_in (the
+// inner IP packet self-describes the source), so msghdr.Name is
+// left nil.
+func prepareRawMessages(n, prefix int) ([]rawMessage, [][]byte) {
 	msgs := make([]rawMessage, n)
 	buffers := make([][]byte, n)
 	iovs := make([]iovec, n)
 
 	for i := range msgs {
-		buffers[i] = make([]byte, udpMTU)
-		iovs[i].Base = &buffers[i][0]
-		iovs[i].Len = uint64(len(buffers[i]))
+		buffers[i] = make([]byte, prefix+udpMTU)
+		iovs[i].Base = &buffers[i][prefix]
+		iovs[i].Len = uint64(udpMTU)
 
 		msgs[i].Hdr.Iov = &iovs[i]
 		msgs[i].Hdr.Iovlen = 1

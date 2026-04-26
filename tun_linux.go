@@ -15,8 +15,18 @@ const (
 	cIFF_TUN         = 0x0001
 	cIFF_NO_PI       = 0x1000
 	cIFF_MULTI_QUEUE = 0x0100
+	cIFF_VNET_HDR    = 0x4000
 	cIFNAMSIZ        = 16
 	cTUNSETIFF       = 0x400454ca
+	cTUNSETOFFLOAD   = 0x400454d0
+	cTUNSETVNETHDRSZ = 0x400454d8
+
+	// Linux uapi/linux/if_tun.h:
+	cTUN_F_CSUM    = 0x01
+	cTUN_F_TSO4    = 0x02
+	cTUN_F_TSO6    = 0x04
+	cTUN_F_TSO_ECN = 0x08
+	cTUN_F_UFO     = 0x10
 )
 
 type ifReq struct {
@@ -40,7 +50,7 @@ func openTUNFD(dev string, multi bool) (*os.File, error) {
 		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
 	}
 	var req ifReq
-	req.Flags = cIFF_TUN | cIFF_NO_PI
+	req.Flags = cIFF_TUN | cIFF_NO_PI | cIFF_VNET_HDR
 	if multi {
 		req.Flags |= cIFF_MULTI_QUEUE
 	}
@@ -48,6 +58,22 @@ func openTUNFD(dev string, multi bool) (*os.File, error) {
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cTUNSETIFF), uintptr(unsafe.Pointer(&req))); errno != 0 {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("TUNSETIFF %s: %w", dev, errno)
+	}
+	// Pin the virtio_net_hdr length to 10 bytes (struct virtio_net_hdr).
+	// Newer kernels advertise virtio_net_hdr_v1 (12 bytes); we only
+	// support the legacy layout in segmentTCPv4 / parseVirtioNetHdr.
+	hdrSize := uintptr(virtioNetHdrLen)
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cTUNSETVNETHDRSZ), uintptr(unsafe.Pointer(&hdrSize))); errno != 0 {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("TUNSETVNETHDRSZ %s: %w", dev, errno)
+	}
+	// Tell kernel we'll handle TCPv4 GSO + checksum offload. Without
+	// this, IFF_VNET_HDR-mode reads still work but the header always
+	// reports gso_type=NONE and we lose the win.
+	off := uintptr(cTUN_F_CSUM | cTUN_F_TSO4)
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cTUNSETOFFLOAD), off); errno != 0 {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("TUNSETOFFLOAD %s: %w", dev, errno)
 	}
 	return os.NewFile(uintptr(fd), "/dev/net/tun"), nil
 }

@@ -139,35 +139,76 @@ func (g *Gofra) Run() error {
 
 // tunReader pumps inner packets from one TUN queue out via the
 // stripe. Multi-queue TUN means the kernel hashes by 5-tuple into
-// one of N queues, so multiple TCP flows can be processed in parallel
-// by N independent goroutines.
+// one of N queues, so multiple TCP flows can be processed in
+// parallel by N independent goroutines.
+//
+// The TUN was opened with IFF_VNET_HDR + TUN_F_CSUM | TUN_F_TSO4
+// so the kernel hands us up to 64 KB super-segments with a 10-byte
+// virtio_net_hdr prefix. For GSO_TCPV4 we segment into MTU-sized
+// real packets in user-space; non-GSO packets pass through as-is
+// (just stripped of their virtio_net_hdr prefix).
 func (g *Gofra) tunReader(idx int, tun *TUN) error {
+	const maxGSOSegs = 64
 	mtu := tun.MTU()
-	buf := make([]byte, mtu+128)
+	// 64 KB pseudo-segment + virtio_net_hdr + slack.
+	buf := make([]byte, virtioNetHdrLen+65535+128)
+	// Per-segment output buffers, one per max segment.
+	segBufs := make([][]byte, maxGSOSegs)
+	for i := range segBufs {
+		segBufs[i] = make([]byte, mtu+128)
+	}
+
+	send := func(payload []byte) {
+		if len(payload) < 20 {
+			return
+		}
+		dst, ok := dstFromIPv4(payload)
+		if !ok {
+			return
+		}
+		p, ok := g.peers[dst]
+		if !ok {
+			return
+		}
+		c := p.rr.Add(1) - 1
+		srcIdx := int(c % uint64(len(g.socks)))
+		dstIdx := int((c / uint64(len(g.socks))) % uint64(len(p.dsts)))
+		if _, err := g.socks[srcIdx].WriteToUDPAddrPort(payload, p.dsts[dstIdx]); err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				g.logger.Warn("udp write failed", "src", srcIdx, "dst", p.dsts[dstIdx], "err", err)
+			}
+		}
+	}
+
 	for {
 		n, err := tun.Read(buf)
 		if err != nil {
 			return fmt.Errorf("tun[%d] read: %w", idx, err)
 		}
-		if n < 20 {
+		if n < virtioNetHdrLen {
 			continue
 		}
-		dst, ok := dstFromIPv4(buf[:n])
-		if !ok {
-			continue
-		}
-		p, ok := g.peers[dst]
-		if !ok {
-			continue
-		}
-		c := p.rr.Add(1) - 1
-		srcIdx := int(c % uint64(len(g.socks)))
-		dstIdx := int((c / uint64(len(g.socks))) % uint64(len(p.dsts)))
-		if _, err := g.socks[srcIdx].WriteToUDPAddrPort(buf[:n], p.dsts[dstIdx]); err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return err
+		hdr := parseVirtioNetHdr(buf[:virtioNetHdrLen])
+		pkt := buf[virtioNetHdrLen:n]
+
+		switch hdr.gsoType {
+		case virtioGSONone:
+			send(pkt)
+		case virtioGSOTCPV4:
+			// We need to put the right TCP/IP checksums in
+			// place even though the kernel asked for csum
+			// offload — UDP underlay can't carry the offload
+			// flag. segmentTCPv4 zeros and recomputes both.
+			segs, err := segmentTCPv4(pkt, int(hdr.gsoSize), segBufs)
+			if err != nil {
+				g.logger.Warn("tun[%d] gso TCPv4 segment failed", "err", err)
+				continue
 			}
-			g.logger.Warn("udp write failed", "src", srcIdx, "dst", p.dsts[dstIdx], "err", err)
+			for i := 0; i < segs; i++ {
+				send(segBufs[i])
+			}
+		default:
+			g.logger.Debug("tun: unsupported gso_type", "type", hdr.gsoType)
 		}
 	}
 }
@@ -183,7 +224,11 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) error {
 		return fmt.Errorf("udp[%d] SyscallConn: %w", idx, err)
 	}
 
-	msgs, buffers := prepareRawMessages(udpRecvBatch)
+	// Reserve virtio_net_hdr at the start of each buffer so we can
+	// tun.Write(buffer[:virtioNetHdrLen+pktLen]) without an extra
+	// copy. The header bytes are zero-initialised at allocation —
+	// no GSO, no checksum-offload hints.
+	msgs, buffers := prepareRawMessages(udpRecvBatch, virtioNetHdrLen)
 	tun := g.tuns[idx%len(g.tuns)]
 
 	var (
@@ -210,7 +255,8 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) error {
 			continue
 		}
 		for i := 0; i < n; i++ {
-			if _, err := tun.Write(buffers[i][:msgs[i].Len]); err != nil {
+			pktLen := int(msgs[i].Len)
+			if _, err := tun.Write(buffers[i][:virtioNetHdrLen+pktLen]); err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					return err
 				}

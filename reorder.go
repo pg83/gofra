@@ -100,18 +100,17 @@ func newReorderPipe(window int, timeout time.Duration, tuns []tunWriter, logger 
 	return p
 }
 
-// reorderLoop drains incoming batches into a flat accumulator,
-// distributes the contents into M sub-slices keyed by seq % M on
-// either threshold (window batches) or timeout, then ships each
-// sub-slice to the matching writer. Writers sort.
+// reorderLoop collects incoming batches by reference, then on
+// either window (batches) or timeout walks the queue once,
+// distributes items into M sub-slices keyed by seq % M, ships
+// each to the matching writer. Writers sort their own bucket.
 //
 // Window is counted in BATCHES, not items — simpler accounting
-// (counter increments once per receive instead of per packet)
-// and matches the natural granularity of pipe.in.
+// and matches the natural granularity of pipe.in. The hot path
+// (per-batch receive) is just one append; the flatten-and-bucket
+// pass happens only at flush.
 func (p *reorderPipe) reorderLoop() {
-	accum := make([]rxItem, 0, p.window*batchSize)
-
-	var batchesIn int
+	batches := make([]*batch, 0, p.window)
 
 	timer := time.NewTimer(p.timeout)
 	defer timer.Stop()
@@ -119,21 +118,30 @@ func (p *reorderPipe) reorderLoop() {
 	m := len(p.outs)
 
 	flush := func() {
-		batchesIn = 0
-
-		if len(accum) == 0 {
+		if len(batches) == 0 {
 			return
+		}
+
+		// Estimate items so each bucket allocates close to its
+		// final size — saves the grow-and-copy churn on the
+		// last bucket-append step.
+		total := 0
+
+		for _, b := range batches {
+			total += len(b.items)
 		}
 
 		buckets := make([][]rxItem, m)
 
 		for i := range buckets {
-			buckets[i] = make([]rxItem, 0, len(accum)/m+1)
+			buckets[i] = make([]rxItem, 0, total/m+1)
 		}
 
-		for _, item := range accum {
-			idx := int(item.seq % uint32(m))
-			buckets[idx] = append(buckets[idx], item)
+		for _, b := range batches {
+			for _, item := range b.items {
+				idx := int(item.seq % uint32(m))
+				buckets[idx] = append(buckets[idx], item)
+			}
 		}
 
 		for i, b := range buckets {
@@ -142,7 +150,7 @@ func (p *reorderPipe) reorderLoop() {
 			}
 		}
 
-		accum = accum[:0]
+		batches = batches[:0]
 	}
 
 	resetTimer := func() {
@@ -172,10 +180,9 @@ func (p *reorderPipe) reorderLoop() {
 				return
 			}
 
-			accum = append(accum, b.items...)
-			batchesIn++
+			batches = append(batches, b)
 
-			if batchesIn >= p.window {
+			if len(batches) >= p.window {
 				flush()
 				resetTimer()
 			}

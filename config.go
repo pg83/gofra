@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/netip"
 	"os"
-	"time"
 )
 
 type tunConfig struct {
@@ -30,7 +29,6 @@ type Config struct {
 	Me         meConfig            `json:"me"`
 	Peers      map[string][]string `json:"peers"`
 	Udp        udpConfig           `json:"udp"`
-	TimeoutUs  int                 `json:"timeout_us"`
 }
 
 type parsedConfig struct {
@@ -44,7 +42,6 @@ type parsedConfig struct {
 	UdpRecvBatch int
 	UdpRecvBuf   int
 	UdpSendBuf   int
-	Timeout      time.Duration
 }
 
 func loadConfig(path string) *parsedConfig {
@@ -127,14 +124,6 @@ func loadConfig(path string) *parsedConfig {
 		udpSendBuf = 16 << 20
 	}
 
-	// timeoutUs in microseconds — single hold knob for the whole
-	// pipeline. Bigger = absorbs more inter-NIC jitter at the
-	// cost of in-tunnel latency.
-	timeoutUs := raw.TimeoutUs
-	if timeoutUs <= 0 {
-		timeoutUs = 1000
-	}
-
 	return &parsedConfig{
 		LogLevel:     logLevel,
 		ListenPort:   uint16(raw.ListenPort),
@@ -146,6 +135,5 @@ func loadConfig(path string) *parsedConfig {
 		UdpRecvBatch: udpRecvBatch,
 		UdpRecvBuf:   udpRecvBuf,
 		UdpSendBuf:   udpSendBuf,
-		Timeout:      time.Duration(timeoutUs) * time.Microsecond,
 	}
 }

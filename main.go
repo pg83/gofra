@@ -10,12 +10,6 @@ import (
 )
 
 func main() {
-	if len(os.Args) >= 2 && os.Args[1] == "perf" {
-		runPerf(os.Args[2:])
-
-		return
-	}
-
 	configPath := flag.String("config", "/etc/gofra/config.json", "path to JSON config")
 	flag.Parse()
 

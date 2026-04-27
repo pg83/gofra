@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"net/netip"
 	"syscall"
@@ -126,31 +125,28 @@ type rawMessage struct {
 	pad uint32
 }
 
-// prepareRawMessages allocates the buffers + sockaddr_in storage
-// for a recvmmsg batch of size n. We need the source address per
-// packet so the receiver can dispatch into the right peer's reorder
-// ring; sockaddr_in is 16 bytes, sockaddr_in6 is 28 — pin to 28 so
-// either fits.
-func prepareRawMessages(n int) (msgs []rawMessage, buffers, names [][]byte) {
+// prepareRawMessagesOffset allocates buffers for a recvmmsg batch
+// of size n. recvmmsg writes payload starting at buffers[i][offset]
+// — so the first `offset` bytes stay untouched and zero, ready as
+// a virtio_net_hdr prefix the udpReader can hand to tun.Write
+// without an extra copy. No sockaddr_in storage: the receive side
+// no longer needs to dispatch by src.
+func prepareRawMessagesOffset(n, offset int) (msgs []rawMessage, buffers [][]byte) {
 	msgs = make([]rawMessage, n)
 	buffers = make([][]byte, n)
-	names = make([][]byte, n)
 	iovs := make([]iovec, n)
 
 	for i := range msgs {
-		buffers[i] = make([]byte, udpMTU)
-		names[i] = make([]byte, 28)
+		buffers[i] = make([]byte, offset+udpMTU)
 
-		iovs[i].Base = &buffers[i][0]
+		iovs[i].Base = &buffers[i][offset]
 		iovs[i].Len = uint64(udpMTU)
 
 		msgs[i].Hdr.Iov = &iovs[i]
 		msgs[i].Hdr.Iovlen = 1
-		msgs[i].Hdr.Name = &names[i][0]
-		msgs[i].Hdr.Namelen = 28
 	}
 
-	return msgs, buffers, names
+	return msgs, buffers
 }
 
 // recvmmsg blocks (via the rawConn) until the kernel hands us 1+
@@ -179,13 +175,3 @@ func recvmmsg(fd uintptr, msgs []rawMessage) (int, bool) {
 	return int(n), true
 }
 
-// fromV4 extracts (ip, port) from a sockaddr_in laid out at
-// names[i][0:16]. Bytes 0..1 = sa_family, 2..4 = port (big-endian),
-// 4..8 = ipv4 addr.
-func fromV4(name []byte) netip.AddrPort {
-	port := binary.BigEndian.Uint16(name[2:4])
-	var ip [4]byte
-	copy(ip[:], name[4:8])
-
-	return netip.AddrPortFrom(netip.AddrFrom4(ip), port)
-}

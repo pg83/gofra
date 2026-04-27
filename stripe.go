@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"errors"
 	"log/slog"
 	"net"
@@ -12,36 +11,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const (
-	// wireSeqLen is the 4-byte monotonic seq prepended to every
-	// outgoing UDP datagram. Receiver strips it before delivery.
-	wireSeqLen = 4
-)
-
 // peer is the dispatch entry for one remote VIP. Holds the underlay
-// dst endpoints to stripe over, the per-peer RR counter, the
-// per-peer outbound seq counter, and the per-peer reorder pipeline
-// used on the inbound side.
+// dst endpoints to stripe over and the per-peer RR counter.
 type peer struct {
-	dsts  []netip.AddrPort
-	rr    atomic.Uint64
-	txSeq atomic.Uint32
-	rx    *reorderPipe
+	dsts []netip.AddrPort
+	rr   atomic.Uint64
 }
 
-// Gofra is the data plane: N src sockets + peer table + N TUN queues.
-// One tunReader goroutine per TUN queue pumps inner packets out via
-// the stripe; one udpReader goroutine per UDP socket pumps inbound
-// packets into the matching peer's reorder pipeline.
+// Gofra is the data plane: N src sockets + N TUN queues + peer table.
+// One tunReader per TUN queue pumps inner packets out via the stripe;
+// one udpReader per UDP socket pumps inbound packets straight into
+// its matching TUN queue. No reorder, no sequence numbers — kernel
+// TCP handles the small amount of cross-NIC reorder via SACK and
+// multi-queue TUN spreads RX softirq across cores.
 type Gofra struct {
 	socks  []*net.UDPConn
 	peers  map[netip.Addr]*peer
-	// peerByDst lets udpReader resolve a from-addr (one of any
-	// peer's dsts) to the owning peer in O(1).
-	peerByDst map[netip.AddrPort]*peer
-	tuns      []*TUN
-	cfg       *parsedConfig
-	logger    *slog.Logger
+	tuns   []*TUN
+	cfg    *parsedConfig
+	logger *slog.Logger
 }
 
 func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
@@ -67,7 +55,6 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 	}
 
 	peers := make(map[netip.Addr]*peer, len(cfg.PeerByVIP))
-	peerByDst := make(map[netip.AddrPort]*peer)
 
 	for vip, ips := range cfg.PeerByVIP {
 		dsts := make([]netip.AddrPort, len(ips))
@@ -76,36 +63,17 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 			dsts[i] = netip.AddrPortFrom(ip, cfg.ListenPort)
 		}
 
-		writers := make([]tunWriter, len(tuns))
+		peers[vip] = &peer{dsts: dsts}
 
-		for i, t := range tuns {
-			writers[i] = t
-		}
-
-		p := &peer{
-			dsts: dsts,
-			rx:   newReorderPipe(cfg.Timeout, writers, logger),
-		}
-		peers[vip] = p
-
-		for _, d := range dsts {
-			peerByDst[d] = p
-		}
-
-		logger.Info("peer registered",
-			"vip", vip,
-			"dsts", dsts,
-			"timeout", cfg.Timeout,
-		)
+		logger.Info("peer registered", "vip", vip, "dsts", dsts)
 	}
 
 	return &Gofra{
-		socks:     socks,
-		peers:     peers,
-		peerByDst: peerByDst,
-		tuns:      tuns,
-		cfg:       cfg,
-		logger:    logger,
+		socks:  socks,
+		peers:  peers,
+		tuns:   tuns,
+		cfg:    cfg,
+		logger: logger,
 	}
 }
 
@@ -140,10 +108,6 @@ func (g *Gofra) Run() error {
 
 		if firstErr == nil {
 			firstErr = e
-
-			for _, p := range g.peers {
-				p.rx.close()
-			}
 
 			closeAllTUNs(g.tuns)
 			closeAllSocks(g.socks)
@@ -181,9 +145,6 @@ func (g *Gofra) Run() error {
 // stripe. Multi-queue TUN means the kernel hashes by 5-tuple into
 // one of N queues, so multiple TCP flows can be processed in
 // parallel by N independent goroutines.
-//
-// Every wire packet gets a 4-byte monotonic seq prepended for the
-// receiver's reorder pipeline.
 func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 	return Try(func() {
 		const maxGSOSegs = 64
@@ -199,9 +160,31 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 			segBufs[i] = make([]byte, mtu+128)
 		}
 
-		txWire := make([]byte, wireSeqLen+mtu+128)
+		send := func(payload []byte) {
+			if len(payload) < 20 {
+				return
+			}
 
-		send := g.makeSender(txWire)
+			dst, ok := dstFromIPv4(payload)
+			if !ok {
+				return
+			}
+
+			p, ok := g.peers[dst]
+			if !ok {
+				return
+			}
+
+			c := p.rr.Add(1) - 1
+			srcIdx := int(c % uint64(len(g.socks)))
+			dstIdx := int((c / uint64(len(g.socks))) % uint64(len(p.dsts)))
+
+			if _, err := g.socks[srcIdx].WriteToUDPAddrPort(payload, p.dsts[dstIdx]); err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					g.logger.Warn("udp write failed", "src", srcIdx, "dst", p.dsts[dstIdx], "err", err)
+				}
+			}
+		}
 
 		for {
 			n := Throw2(t.Read(buf))
@@ -246,58 +229,27 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 	})
 }
 
-// makeSender returns the per-tunReader stripe-and-send closure. It
-// reuses the caller-provided txWire scratch buffer to assemble
-// [seq 4B][payload] in one piece — single WriteToUDPAddrPort, one
-// memcpy of the payload.
-func (g *Gofra) makeSender(txWire []byte) func([]byte) {
-	return func(payload []byte) {
-		if len(payload) < 20 {
-			return
-		}
-
-		dst, ok := dstFromIPv4(payload)
-		if !ok {
-			return
-		}
-
-		p, ok := g.peers[dst]
-		if !ok {
-			return
-		}
-
-		c := p.rr.Add(1) - 1
-		srcIdx := int(c % uint64(len(g.socks)))
-		dstIdx := int((c / uint64(len(g.socks))) % uint64(len(p.dsts)))
-
-		seq := p.txSeq.Add(1) - 1
-
-		binary.BigEndian.PutUint32(txWire[:wireSeqLen], seq)
-		copy(txWire[wireSeqLen:], payload)
-		wire := txWire[:wireSeqLen+len(payload)]
-
-		if _, err := g.socks[srcIdx].WriteToUDPAddrPort(wire, p.dsts[dstIdx]); err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				g.logger.Warn("udp write failed", "src", srcIdx, "dst", p.dsts[dstIdx], "err", err)
-			}
-		}
-	}
-}
-
-// udpReader pumps inbound UDP packets through to the reorder
-// pipeline. recvmmsg drains the kernel — every syscall returns
-// 1+ packets in one go, which we group by peer and ship as one
-// batch per peer per recvmmsg call. No userspace accumulator,
-// no timer: the reorder goroutine downstream is the sole hold
-// point in the pipeline.
+// udpReader drains one UDP socket via recvmmsg and writes each
+// packet straight into its own TUN queue (tuns[idx]). Per-flow
+// 5-tuple hashing inside the kernel keeps a given TCP flow's
+// segments going through the same socket → same TUN queue → same
+// receive softirq core, so nothing here needs reorder protection.
+//
+// On TUN we have IFF_VNET_HDR enabled, so every write needs the
+// 10-byte virtio_net_hdr prefix; we keep one zeroed prefix slot in
+// each recv buffer so writes go out in a single buffer with no
+// extra copies.
 func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 	return Try(func() {
 		rc := Throw2(s.SyscallConn())
 
-		msgs, buffers, names := prepareRawMessages(g.cfg.UdpRecvBatch)
+		// Each recv buffer is laid out as [10 zero virtio_net_hdr]
+		// [up to 65525 bytes inner IP packet]. recvmmsg writes
+		// starting at offset virtioNetHdrLen so the prefix slot
+		// stays untouched and zero, ready for tun.Write.
+		msgs, buffers := prepareRawMessagesOffset(g.cfg.UdpRecvBatch, virtioNetHdrLen)
 
-		// Per-recvmmsg grouping. Reused across iterations.
-		grouped := make(map[*peer][]rxItem)
+		tun := g.tuns[idx]
 
 		var (
 			n    int
@@ -320,35 +272,15 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 			for i := 0; i < n; i++ {
 				wireLen := int(msgs[i].Len)
 
-				if wireLen < wireSeqLen+20 {
+				if wireLen < 20 {
 					continue
 				}
 
-				seq := binary.BigEndian.Uint32(buffers[i][:wireSeqLen])
-				inner := buffers[i][wireSeqLen:wireLen]
-
-				from := fromV4(names[i])
-
-				p, ok := g.peerByDst[from]
-				if !ok {
-					g.logger.Debug("udp: drop packet from unknown peer src", "from", from)
-
-					continue
+				if _, err := tun.Write(buffers[i][:virtioNetHdrLen+wireLen]); err != nil {
+					if !errors.Is(err, net.ErrClosed) {
+						g.logger.Warn("tun write failed", "queue", idx, "err", err)
+					}
 				}
-
-				// Allocate item with the virtio prefix already
-				// in place (zero) and the inner payload copied
-				// in. The writer can tun.Write(item.payload)
-				// directly — no further copies on the hot path.
-				payload := make([]byte, virtioNetHdrLen+len(inner))
-				copy(payload[virtioNetHdrLen:], inner)
-
-				grouped[p] = append(grouped[p], rxItem{seq: seq, payload: payload})
-			}
-
-			for p, items := range grouped {
-				p.rx.in <- &batch{items: items}
-				delete(grouped, p)
 			}
 		}
 	})

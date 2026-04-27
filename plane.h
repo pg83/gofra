@@ -14,7 +14,7 @@ namespace gofra {
     // pool->make one before the thread starts.
     struct TunReaderScratch;
 
-    // Per-udpReader scratch (64-deep mmsghdr / iovec / sockaddr_in
+    // Per-udpReader scratch (64-deep mmsghdr / iovec / sockaddr*
     // table + 64 × (10 B virtio_net_hdr + jumbo payload) buffers,
     // pre-wired). Same lifetime story as TunReaderScratch.
     struct UdpReaderScratch;

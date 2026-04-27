@@ -1,4 +1,5 @@
 #include "socks.h"
+#include "addr.h"
 
 #include <std/lib/buffer.h>
 #include <std/mem/obj_pool.h>
@@ -78,10 +79,10 @@ namespace {
     }
 }
 
-int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int sndBuf) {
+int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int sndBuf) {
     // Blocking socket — udpReader pthreads block on recvmmsg with
     // MSG_WAITFORONE; non-blocking would just spin EAGAIN.
-    int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int fd = ::socket(src->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"socket(UDP)"));
@@ -92,9 +93,11 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int 
     // destructor chain will reap when the surrounding scope unwinds.
     pool->make<ScopedFD>(fd);
 
+    auto* sin = (const sockaddr_in*)src;
+
     char ifname[IFNAMSIZ];
 
-    size_t ifnameLen = ifaceFor(src->sin_addr.s_addr, ifname);
+    size_t ifnameLen = ifaceFor(sin->sin_addr.s_addr, ifname);
 
     if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, ifnameLen) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"SO_BINDTODEVICE ") << StringView(ifname));
@@ -109,16 +112,16 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int 
         Errno().raise(StringBuilder() << StringView(u8"SO_REUSEADDR"));
     }
 
-    if (::bind(fd, (sockaddr*)src, sizeof(*src)) < 0) {
+    if (::bind(fd, src, addrLen(src)) < 0) {
         char buf[INET_ADDRSTRLEN] = {0};
 
-        inet_ntop(AF_INET, &src->sin_addr, buf, sizeof(buf));
+        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
 
         Errno().raise(StringBuilder()
                       << StringView(u8"bind ")
                       << StringView(buf)
                       << StringView(u8":")
-                      << (u64)ntohs(src->sin_port));
+                      << (u64)ntohs(sin->sin_port));
     }
 
     return fd;

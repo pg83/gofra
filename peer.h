@@ -2,7 +2,7 @@
 
 #include <std/sys/types.h>
 
-struct sockaddr_in;
+struct sockaddr;
 
 namespace stl {
     class ObjPool;
@@ -18,7 +18,7 @@ namespace gofra {
     struct Peer {
         virtual u32 vip() const noexcept = 0;
         virtual size_t dstCount() const noexcept = 0;
-        virtual const sockaddr_in* dst(size_t i) const noexcept = 0;
+        virtual const sockaddr* dst(size_t i) const noexcept = 0;
     };
 
     // PeerTable: pure cluster map, every overlay-VIP → Peer in the

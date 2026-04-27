@@ -1,6 +1,7 @@
 #include "addr.h"
 
 #include <std/lib/buffer.h>
+#include <std/mem/obj_pool.h>
 #include <std/str/builder.h>
 #include <std/str/view.h>
 #include <std/sys/crt.h>
@@ -9,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 
 using namespace stl;
 
@@ -74,22 +76,33 @@ void gofra::parseCIDR(StringView s, u32* addr, u8* prefixLen) {
     }
 }
 
-sockaddr_in gofra::makeAddr(u32 ip, u16 port) {
-    sockaddr_in sa = {};
-
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(ip);
-
-    return sa;
-}
-
-sockaddr_in gofra::parseSockAddr(StringView s) {
+const sockaddr* gofra::parseSockAddr(ObjPool* pool, StringView s) {
     StringView ipPart, portPart;
 
     if (!s.split(':', ipPart, portPart)) {
         raise(StringBuilder() << StringView(u8"expected ip:port, got: ") << s);
     }
 
-    return makeAddr(parseIPv4(ipPart), (u16)portPart.stou());
+    u32 ip = parseIPv4(ipPart);
+    u16 port = (u16)portPart.stou();
+
+    auto* ss = pool->make<sockaddr_storage>();
+    auto* sin = (sockaddr_in*)ss;
+
+    sin->sin_family = AF_INET;
+    sin->sin_port = htons(port);
+    sin->sin_addr.s_addr = htonl(ip);
+
+    return (const sockaddr*)ss;
+}
+
+u32 gofra::addrLen(const sockaddr* sa) noexcept {
+    switch (sa->sa_family) {
+        case AF_INET:
+            return sizeof(sockaddr_in);
+        case AF_INET6:
+            return sizeof(sockaddr_in6);
+    }
+
+    return sizeof(sockaddr_storage);
 }

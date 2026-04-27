@@ -10,7 +10,7 @@
 #include <std/sym/i_map.h>
 #include <std/sys/throw.h>
 
-#include <netinet/in.h>
+#include <sys/socket.h>
 
 using namespace stl;
 using namespace gofra;
@@ -38,7 +38,7 @@ namespace {
 
     struct PeerImpl: public Peer {
         u32 vip_;
-        Vector<sockaddr_in> dsts_;
+        Vector<const sockaddr*> dsts_;
 
         explicit PeerImpl(u32 vip) noexcept
             : vip_(vip)
@@ -53,8 +53,8 @@ namespace {
             return dsts_.length();
         }
 
-        const sockaddr_in* dst(size_t i) const noexcept override {
-            return &dsts_[i];
+        const sockaddr* dst(size_t i) const noexcept override {
+            return dsts_[i];
         }
     };
 
@@ -107,7 +107,7 @@ PeerTableImpl::PeerTableImpl(ObjPool* pool, ini::Section* sec)
         auto p = pool->make<PeerImpl>(vip);
 
         forEachItem(dstStr, [&](StringView it) {
-            p->dsts_.pushBack(parseSockAddr(it));
+            p->dsts_.pushBack(parseSockAddr(pool, it));
         });
 
         if (p->dsts_.length() == 0) {

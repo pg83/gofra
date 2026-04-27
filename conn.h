@@ -2,7 +2,7 @@
 
 #include <std/sys/types.h>
 
-struct sockaddr_in;
+struct sockaddr;
 
 namespace stl {
     class ObjPool;
@@ -16,9 +16,9 @@ namespace gofra {
     // informational (the self underlay this slot's socket is bound on);
     // dstAddr + srcFd are what tunReader hands to sendto.
     struct ConnSlot {
-        const sockaddr_in* srcAddr;
+        const sockaddr* srcAddr;
         int srcFd;
-        const sockaddr_in* dstAddr;
+        const sockaddr* dstAddr;
     };
 
     // Per-peer outgoing connection state. Holds an N*M array of

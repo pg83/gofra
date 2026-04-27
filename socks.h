@@ -2,7 +2,7 @@
 
 #include <std/sys/types.h>
 
-struct sockaddr_in;
+struct sockaddr;
 
 namespace stl {
     class ObjPool;
@@ -13,5 +13,5 @@ namespace gofra {
     // src via SO_BINDTODEVICE, bumps SO_RCVBUFFORCE / SO_SNDBUFFORCE
     // to the configured size. The fd is registered in `pool` for
     // ::close on pool destruction; the returned int is the live fd.
-    int openUdpSocket(stl::ObjPool* pool, const sockaddr_in* src, int rcvBuf, int sndBuf);
+    int openUdpSocket(stl::ObjPool* pool, const sockaddr* src, int rcvBuf, int sndBuf);
 }

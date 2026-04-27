@@ -1,4 +1,5 @@
 #include "plane.h"
+#include "addr.h"
 #include "conn.h"
 #include "gso.h"
 #include "peer.h"
@@ -13,7 +14,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 
 using namespace stl;
 using namespace gofra;
@@ -46,18 +46,22 @@ struct gofra::TunReaderScratch {
 // 64-deep recvmmsg batch. Each slot's iov_base points 10 bytes
 // into its buffer so the virtio_net_hdr prefix stays zero — when
 // we hand the packet to the TUN it's read as gso_type=NONE / no
-// flags. addr/iov/msghdr indices match buffer index.
+// flags. addr/iov/msghdr indices match buffer index. addrs[i]
+// points at a pool-allocated sockaddr_storage so the scratch
+// itself stays AF-agnostic.
 struct gofra::UdpReaderScratch {
     static constexpr size_t BATCH    = 64;
     static constexpr size_t MSG_SIZE = 10 + 9000;        // virtio + jumbo
 
     mmsghdr msgs[BATCH];
     iovec iovs[BATCH];
-    sockaddr_in addrs[BATCH];
+    sockaddr* addrs[BATCH];
     u8 bufs[BATCH][MSG_SIZE];
 
-    UdpReaderScratch() noexcept {
+    explicit UdpReaderScratch(ObjPool* pool) noexcept {
         for (size_t i = 0; i < BATCH; ++i) {
+            addrs[i] = (sockaddr*)pool->make<sockaddr_storage>();
+
             // Pre-zero the virtio_net_hdr prefix. recvmmsg writes
             // into iov_base which is buf + 10; the prefix stays
             // untouched and zero across iterations.
@@ -68,8 +72,8 @@ struct gofra::UdpReaderScratch {
 
             msgs[i].msg_hdr.msg_iov     = &iovs[i];
             msgs[i].msg_hdr.msg_iovlen  = 1;
-            msgs[i].msg_hdr.msg_name    = &addrs[i];
-            msgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+            msgs[i].msg_hdr.msg_name    = addrs[i];
+            msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
             msgs[i].msg_hdr.msg_control = nullptr;
             msgs[i].msg_hdr.msg_controllen = 0;
             msgs[i].msg_hdr.msg_flags   = 0;
@@ -95,8 +99,8 @@ namespace {
         auto slot = conn->next();
 
         ssize_t r = ::sendto(slot->srcFd, pkt, len, 0,
-                             (const sockaddr*)slot->dstAddr,
-                             sizeof(*slot->dstAddr));
+                             slot->dstAddr, addrLen(slot->dstAddr));
+
         if (r < 0) {
             warnErrno(StringView(u8"udp sendto"), errno);
         }
@@ -108,7 +112,7 @@ TunReaderScratch* gofra::makeTunReaderScratch(ObjPool* pool) {
 }
 
 UdpReaderScratch* gofra::makeUdpReaderScratch(ObjPool* pool) {
-    return pool->make<UdpReaderScratch>();
+    return pool->make<UdpReaderScratch>(pool);
 }
 
 void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
@@ -191,7 +195,7 @@ void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
             // Reset namelen for the next round; recvmmsg shrinks it
             // to the actual sender addr len (16 for IPv4) but we
             // also rely on the iov_len being preserved across calls.
-            sc->msgs[i].msg_hdr.msg_namelen = sizeof(sc->addrs[i]);
+            sc->msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
 
             // [10 B virtio_net_hdr (zeroed once at scratch ctor) | payload].
             ssize_t w = ::write(tunFd, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen);

@@ -7,7 +7,7 @@
 #include <std/sym/i_map.h>
 #include <std/sys/atomic.h>
 
-#include <netinet/in.h>
+#include <sys/socket.h>
 
 using namespace stl;
 using namespace gofra;

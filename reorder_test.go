@@ -66,7 +66,7 @@ func BenchmarkReorderPipeline(b *testing.B) {
 
 	fakes, writers := makeFakeWriters(4)
 
-	pipe := newReorderPipe(16, time.Millisecond, 16, time.Millisecond, writers, silentLogger())
+	pipe := newReorderPipe(time.Millisecond, time.Millisecond, writers, silentLogger())
 	defer pipe.close()
 
 	rng := rand.New(rand.NewSource(1))
@@ -108,7 +108,7 @@ func BenchmarkReorderPipelineSorted(b *testing.B) {
 
 	fakes, writers := makeFakeWriters(4)
 
-	pipe := newReorderPipe(16, time.Millisecond, 16, time.Millisecond, writers, silentLogger())
+	pipe := newReorderPipe(time.Millisecond, time.Millisecond, writers, silentLogger())
 	defer pipe.close()
 
 	pay := make([]byte, payloadLen)
@@ -156,7 +156,7 @@ func TestReorderPipelineDelivers(t *testing.T) {
 
 	fakes, writers := makeFakeWriters(4)
 
-	pipe := newReorderPipe(8, time.Millisecond, 8, time.Millisecond, writers, silentLogger())
+	pipe := newReorderPipe(time.Millisecond, time.Millisecond, writers, silentLogger())
 	defer pipe.close()
 
 	rng := rand.New(rand.NewSource(42))

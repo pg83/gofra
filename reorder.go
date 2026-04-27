@@ -17,14 +17,13 @@ import (
 //      │   batch up to batchSize packets, ship to peer's `in`
 //      ▼   (idle batches flushed by their owning udpReader)
 //   1 reorder goroutine per peer
-//      │   accumulate batches until `window` items or `timeout`,
-//      │   THEN bucket items by seq % numWriters into M sub-slices
-//      │   (no sort here — that's the writers' job),
-//      │   ship each sub-slice as one channel send.
+//      │   accumulate batches for `timeout`, THEN bucket items by
+//      │   seq % numWriters into M sub-slices (no sort here —
+//      │   that's the writers' job), ship each sub-slice as one
+//      │   channel send.
 //      ▼
 //   M writer goroutines, one per TUN queue
-//      │   sort own sub-slice (~window/M items, O(n log n) on a
-//      │   tiny n), tun.Write each in seq order.
+//      │   sort own sub-slice, tun.Write each in seq order.
 //
 // Why distribute-then-sort instead of sort-then-distribute:
 // parallelises the sort over M cores. Each writer sorts only its
@@ -47,9 +46,7 @@ type reorderPipe struct {
 	outs []chan []rxItem
 	stop chan struct{}
 
-	window        int
 	timeout       time.Duration
-	writerBucket  int
 	writerTimeout time.Duration
 	logger        *slog.Logger
 }
@@ -79,14 +76,12 @@ type batch struct {
 	items []rxItem
 }
 
-func newReorderPipe(window int, timeout time.Duration, writerBucket int, writerTimeout time.Duration, tuns []tunWriter, logger *slog.Logger) *reorderPipe {
+func newReorderPipe(timeout time.Duration, writerTimeout time.Duration, tuns []tunWriter, logger *slog.Logger) *reorderPipe {
 	p := &reorderPipe{
 		in:            make(chan *batch, 64),
 		outs:          make([]chan []rxItem, len(tuns)),
 		stop:          make(chan struct{}),
-		window:        window,
 		timeout:       timeout,
-		writerBucket:  writerBucket,
 		writerTimeout: writerTimeout,
 		logger:        logger,
 	}
@@ -104,17 +99,16 @@ func newReorderPipe(window int, timeout time.Duration, writerBucket int, writerT
 	return p
 }
 
-// reorderLoop collects incoming batches by reference, then on
-// either window (batches) or timeout walks the queue once,
-// distributes items into M sub-slices keyed by seq % M, ships
-// each to the matching writer. Writers sort their own bucket.
+// reorderLoop collects incoming batches by reference, then every
+// `timeout` walks the queue once, distributes items into M
+// sub-slices keyed by seq % M, ships each to the matching writer.
+// Writers sort their own bucket.
 //
-// Window is counted in BATCHES, not items — simpler accounting
-// and matches the natural granularity of pipe.in. The hot path
-// (per-batch receive) is just one append; the flatten-and-bucket
-// pass happens only at flush.
+// Timeout is the only flush trigger: at the speeds we run, a
+// batch-count window would always be over-provisioned (timer fires
+// long before any sane window fills) and was just dead code.
 func (p *reorderPipe) reorderLoop() {
-	batches := make([]*batch, 0, p.window)
+	batches := make([]*batch, 0, 64)
 
 	timer := time.NewTimer(p.timeout)
 	defer timer.Stop()
@@ -157,17 +151,6 @@ func (p *reorderPipe) reorderLoop() {
 		batches = batches[:0]
 	}
 
-	resetTimer := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-
-		timer.Reset(p.timeout)
-	}
-
 	for {
 		select {
 		case <-p.stop:
@@ -186,11 +169,6 @@ func (p *reorderPipe) reorderLoop() {
 
 			batches = append(batches, b)
 
-			if len(batches) >= p.window {
-				flush()
-				resetTimer()
-			}
-
 		case <-timer.C:
 			flush()
 			timer.Reset(p.timeout)
@@ -198,23 +176,16 @@ func (p *reorderPipe) reorderLoop() {
 	}
 }
 
-// writerLoop accumulates sub-slices from the reorder goroutine
-// until either `writerBucket` of them have come in or
-// `writerTimeout` elapses, then sorts the combined set by seq and
+// writerLoop accumulates sub-slices from the reorder goroutine,
+// then every `writerTimeout` sorts the combined set by seq and
 // tun.Write's each item in order.
-//
-// Bigger bucket → bigger monotonic run on the TUN device, less
-// per-packet sort overhead. Smaller bucket → lower latency.
 func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun tunWriter) {
-	pending := make([]rxItem, 0, p.writerBucket*64)
-	subs := 0
+	pending := make([]rxItem, 0, 256)
 
 	timer := time.NewTimer(p.writerTimeout)
 	defer timer.Stop()
 
 	flush := func() {
-		subs = 0
-
 		if len(pending) == 0 {
 			return
 		}
@@ -232,17 +203,6 @@ func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun tunWriter) {
 		pending = pending[:0]
 	}
 
-	resetTimer := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-
-		timer.Reset(p.writerTimeout)
-	}
-
 	for {
 		select {
 		case sub, ok := <-in:
@@ -253,12 +213,6 @@ func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun tunWriter) {
 			}
 
 			pending = append(pending, sub...)
-			subs++
-
-			if subs >= p.writerBucket {
-				flush()
-				resetTimer()
-			}
 
 		case <-timer.C:
 			flush()

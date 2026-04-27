@@ -25,12 +25,10 @@ type udpConfig struct {
 }
 
 type reorderConfig struct {
-	Window    int `json:"window"`
 	TimeoutUs int `json:"timeout_us"`
 }
 
 type writerConfig struct {
-	Bucket    int `json:"bucket"`
 	TimeoutUs int `json:"timeout_us"`
 }
 
@@ -55,9 +53,7 @@ type parsedConfig struct {
 	UdpRecvBatch   int
 	UdpRecvBuf     int
 	UdpSendBuf     int
-	ReorderWindow  int
 	ReorderTimeout time.Duration
-	WriterBucket   int
 	WriterTimeout  time.Duration
 }
 
@@ -141,30 +137,12 @@ func loadConfig(path string) *parsedConfig {
 		udpSendBuf = 16 << 20
 	}
 
-	// Reorder.Window is in BATCHES (the reorder goroutine
-	// counts incoming pipe.in receives, not items). Real LAN
-	// reorder distance is microseconds, so the timeout below
-	// usually fires first; window is the safety bound on
-	// burst-driven accumulator size.
-	reorderWindow := raw.Reorder.Window
-	if reorderWindow <= 0 {
-		reorderWindow = 16
-	}
-
-	// timeout in microseconds for finer tuning. Default 1 ms.
+	// timeout in microseconds. Sole flush trigger for reorder +
+	// writer loops; bigger = absorbs more inter-NIC jitter at
+	// the cost of in-tunnel latency.
 	reorderTimeoutUs := raw.Reorder.TimeoutUs
 	if reorderTimeoutUs <= 0 {
 		reorderTimeoutUs = 1000
-	}
-
-	// Writer.Bucket counts how many sub-slices the writer
-	// accumulates from the reorder goroutine before sorting +
-	// flushing to TUN. Bigger bucket = bigger sort batch
-	// (longer monotonic run on TUN), smaller bucket = lower
-	// per-packet latency.
-	writerBucket := raw.Writer.Bucket
-	if writerBucket <= 0 {
-		writerBucket = 16
 	}
 
 	writerTimeoutUs := raw.Writer.TimeoutUs
@@ -183,9 +161,7 @@ func loadConfig(path string) *parsedConfig {
 		UdpRecvBatch:   udpRecvBatch,
 		UdpRecvBuf:     udpRecvBuf,
 		UdpSendBuf:     udpSendBuf,
-		ReorderWindow:  reorderWindow,
 		ReorderTimeout: time.Duration(reorderTimeoutUs) * time.Microsecond,
-		WriterBucket:   writerBucket,
 		WriterTimeout:  time.Duration(writerTimeoutUs) * time.Microsecond,
 	}
 }

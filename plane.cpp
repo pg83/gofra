@@ -115,44 +115,44 @@ namespace {
         }
     }
 
-    // Send the N gsoSplit segments via sendmsg + UDP_SEGMENT cmsg.
-    // The segments are scatter-gathered as iovecs; the kernel
-    // concatenates them and re-segments by gso_size into UDP
-    // datagrams. gsoSplit's output guarantees [0..N-2] are equal-
-    // sized and the last is ≤ that size — exactly what UDP_SEGMENT
-    // expects.
+    // Send the N gsoSplit segments as USO_PARTS sendmsg+UDP_SEGMENT
+    // calls, each part through its own stripe slot. This restores
+    // RX parallelism: a single super-packet's segments land on
+    // multiple (src,dst) pairs — and so on multiple peer udpReader
+    // threads — instead of one. Each part is small enough to stay
+    // well under the kernel's IP_MAX_MTU cork cap (~65515 B), so no
+    // further byte-chunking inside a part.
     //
-    // The kernel caps each sendmsg super-payload at IP_MAX_MTU
-    // (~65515 B) since the GSO super-skb is one IP datagram from
-    // its POV. With ~46 MTU-sized segments we sit right at the
-    // edge, so we chunk: each chunk is ≤ MAX_USO_BYTES and only
-    // the last segment of the FINAL chunk may be smaller than
-    // gso_size (gsoSplit's invariant). All chunks reuse one stripe
-    // slot, so the per-super-packet stripe semantics hold.
-    constexpr size_t MAX_USO_BYTES = 60 * 1024;
+    // Each part's segments are equal-sized except possibly the very
+    // last one of the LAST part (gsoSplit's invariant), which is
+    // exactly what UDP_SEGMENT expects.
+    constexpr int USO_PARTS = 8;
 
     void sendUso(Conn* conn, TunReaderScratch* sc, int segs) {
-        auto* slot = conn->next();
+        int partSize = (segs + USO_PARTS - 1) / USO_PARTS;
         u16 gsoSize = (u16)sc->segSizes[0];
 
         int i = 0;
 
         while (i < segs) {
-            size_t total = 0;
-            int j = i;
+            int end = i + partSize;
 
-            while (j < segs && total + sc->segSizes[j] <= MAX_USO_BYTES) {
-                sc->iovs[j].iov_base = sc->segBufs[j];
-                sc->iovs[j].iov_len  = sc->segSizes[j];
-                total += sc->segSizes[j];
-                ++j;
+            if (end > segs) {
+                end = segs;
             }
+
+            for (int k = i; k < end; ++k) {
+                sc->iovs[k].iov_base = sc->segBufs[k];
+                sc->iovs[k].iov_len  = sc->segSizes[k];
+            }
+
+            auto* slot = conn->next();
 
             msghdr msg = {};
             msg.msg_name    = (void*)slot->dstAddr;
             msg.msg_namelen = addrLen(slot->dstAddr);
             msg.msg_iov     = &sc->iovs[i];
-            msg.msg_iovlen  = (size_t)(j - i);
+            msg.msg_iovlen  = (size_t)(end - i);
 
             alignas(cmsghdr) char cbuf[CMSG_SPACE(sizeof(u16))];
             msg.msg_control    = cbuf;
@@ -170,7 +170,7 @@ namespace {
                 warnErrno(StringView(u8"udp sendmsg(USO)"), errno);
             }
 
-            i = j;
+            i = end;
         }
     }
 }

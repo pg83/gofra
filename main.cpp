@@ -53,8 +53,8 @@ namespace {
         auto pool = ObjPool::fromMemory();
         auto cfg = loadConfig(pool.mutPtr(), configPath);
 
-        int tunFd = openTun(cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
-        int udpFd = openUdpSocket(&cfg->underlay[0], cfg->udpRecvBuf, cfg->udpSendBuf);
+        int tunFd = openTun(pool.mutPtr(), cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
+        int udpFd = openUdpSocket(pool.mutPtr(), &cfg->underlay[0], cfg->udpRecvBuf, cfg->udpSendBuf);
 
         sysE << StringView(u8"gofra2: tun=") << StringView(cfg->tunDev)
              << StringView(u8" mtu=") << (u64)cfg->tunMtu

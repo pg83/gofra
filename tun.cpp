@@ -1,9 +1,11 @@
 #include "tun.h"
 
 #include <std/lib/buffer.h>
+#include <std/mem/obj_pool.h>
 #include <std/str/view.h>
 #include <std/str/builder.h>
 #include <std/sys/crt.h>
+#include <std/sys/fd.h>
 #include <std/sys/throw.h>
 
 #include <fcntl.h>
@@ -40,25 +42,25 @@ namespace {
     // not a setter — it doesn't suffer from the SIOCSIF* P2P-route bug
     // we worked around by going to netlink for SET ops.
     int ifIndexFor(const char* dev) {
-        int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-        if (s < 0) {
+        int rawS = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (rawS < 0) {
             Errno().raise(StringBuilder() << StringView(u8"socket(AF_INET,SOCK_DGRAM)"));
         }
+
+        // Function-scoped fd: stack RAII via stl::ScopedFD closes it on
+        // any return / throw without bothering the caller's pool.
+        ScopedFD s(rawS);
 
         ifreq ifr = {};
         copyIfName(ifr.ifr_name, StringView(dev));
 
-        if (ioctl(s, SIOCGIFINDEX, &ifr) < 0) {
-            int e = errno;
-            ::close(s);
-            Errno(e).raise(StringBuilder()
-                           << StringView(u8"SIOCGIFINDEX ")
-                           << StringView(dev));
+        if (ioctl(s.get(), SIOCGIFINDEX, &ifr) < 0) {
+            Errno().raise(StringBuilder()
+                          << StringView(u8"SIOCGIFINDEX ")
+                          << StringView(dev));
         }
 
-        int idx = ifr.ifr_ifindex;
-        ::close(s);
-        return idx;
+        return ifr.ifr_ifindex;
     }
 
     // Thin RAII wrapper around an mnl_socket bound to NETLINK_ROUTE.
@@ -195,20 +197,22 @@ namespace {
     }
 }
 
-int gofra::openTun(const char* dev, int mtu, u32 vip, u8 prefixLen) {
+int gofra::openTun(ObjPool* pool, const char* dev, int mtu, u32 vip, u8 prefixLen) {
     int fd = ::open("/dev/net/tun", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"open /dev/net/tun"));
     }
+
+    // Hand fd ownership to the pool — any throw below leaves a live
+    // fd that the pool's destructor chain will reap on unwind.
+    pool->make<ScopedFD>(fd);
 
     ifreq ifr = {};
     ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
     copyIfName(ifr.ifr_name, StringView(dev));
 
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
-        int e = errno;
-        ::close(fd);
-        Errno(e).raise(StringBuilder() << StringView(u8"TUNSETIFF ") << StringView(dev));
+        Errno().raise(StringBuilder() << StringView(u8"TUNSETIFF ") << StringView(dev));
     }
 
     configure(dev, mtu, vip, prefixLen);

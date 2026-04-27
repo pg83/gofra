@@ -4,9 +4,14 @@
 
 struct sockaddr_in;
 
+namespace stl {
+    class ObjPool;
+}
+
 namespace gofra {
     // openUdpSocket binds (src), pins egress to the iface that owns
     // src via SO_BINDTODEVICE, bumps SO_RCVBUFFORCE / SO_SNDBUFFORCE
-    // to the configured size. Returns the socket fd.
-    int openUdpSocket(const sockaddr_in* src, int rcvBuf, int sndBuf);
+    // to the configured size. The fd is registered in `pool` for
+    // ::close on pool destruction; the returned int is the live fd.
+    int openUdpSocket(stl::ObjPool* pool, const sockaddr_in* src, int rcvBuf, int sndBuf);
 }

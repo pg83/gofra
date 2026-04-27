@@ -1,9 +1,11 @@
 #include "socks.h"
 
 #include <std/lib/buffer.h>
+#include <std/mem/obj_pool.h>
 #include <std/str/view.h>
 #include <std/str/builder.h>
 #include <std/sys/crt.h>
+#include <std/sys/fd.h>
 #include <std/sys/throw.h>
 
 #include <unistd.h>
@@ -69,11 +71,16 @@ namespace {
     }
 }
 
-int gofra::openUdpSocket(const sockaddr_in* src, int rcvBuf, int sndBuf) {
+int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int sndBuf) {
     int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"socket(UDP)"));
     }
+
+    // Hand fd ownership to the pool — pool death triggers ::close.
+    // From here on any throw still leaves a live fd that the pool's
+    // destructor chain will reap when the surrounding scope unwinds.
+    pool->make<ScopedFD>(fd);
 
     char ifname[IFNAMSIZ];
     size_t ifnameLen = ifaceFor(src->sin_addr.s_addr, ifname);

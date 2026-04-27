@@ -56,18 +56,6 @@ namespace {
         sysE << StringView(u8"gofra2: ") << msg << endL;
     }
 
-    bool dstFromIPv4(const u8* pkt, size_t len, u32* out) noexcept {
-        if (len < 20) {
-            return false;
-        }
-        if ((pkt[0] >> 4) != 4) {
-            return false;
-        }
-        *out = ((u32)pkt[16] << 24) | ((u32)pkt[17] << 16)
-             | ((u32)pkt[18] <<  8) | (u32)pkt[19];
-        return true;
-    }
-
     // Send one fully-formed inner IP packet via the next stripe slot.
     void sendOne(IoReactor* reactor, Conn* conn, const u8* pkt, size_t len) {
         auto slot = conn->next();

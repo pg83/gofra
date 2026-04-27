@@ -8,10 +8,10 @@
 #include <std/mem/obj_pool.h>
 
 #include <errno.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <net/if.h>
 #include <ifaddrs.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -81,16 +81,17 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int snd
     }
 
     if (::bind(fd, src, addrLen(src)) < 0) {
-        auto* sin = (const sockaddr_in*)src;
-        char buf[INET_ADDRSTRLEN] = {0};
+        char host[INET6_ADDRSTRLEN] = {0};
+        char serv[8] = {0};
 
-        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+        getnameinfo(src, addrLen(src), host, sizeof(host), serv, sizeof(serv),
+                    NI_NUMERICHOST | NI_NUMERICSERV);
 
         Errno().raise(StringBuilder()
                       << StringView(u8"bind ")
-                      << StringView(buf)
+                      << StringView(host)
                       << StringView(u8":")
-                      << (u64)ntohs(sin->sin_port));
+                      << StringView(serv));
     }
 
     return fd;

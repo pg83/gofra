@@ -8,6 +8,7 @@
 #include <std/sys/throw.h>
 #include <std/dbg/verify.h>
 
+#include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -34,6 +35,13 @@ namespace {
     [[noreturn]] void raise(Buffer&& msg) {
         throw AddrError(static_cast<Buffer&&>(msg));
     }
+
+    template <size_t N>
+    void toCStr(char (&dst)[N], StringView s) {
+        STD_VERIFY(s.length() < N);
+        memCpy(dst, s.data(), s.length());
+        dst[s.length()] = 0;
+    }
 }
 
 StringView AddrError::description() {
@@ -51,9 +59,7 @@ StringView AddrError::description() {
 
 u32 gofra::parseIPv4(StringView s) {
     char buf[16];
-    STD_VERIFY(s.length() < sizeof(buf));
-    memCpy(buf, s.data(), s.length());
-    buf[s.length()] = 0;
+    toCStr(buf, s);
 
     in_addr a;
 
@@ -79,19 +85,36 @@ void gofra::parseCIDR(StringView s, u32* addr, u8* prefixLen) {
 const sockaddr* gofra::parseSockAddr(ObjPool* pool, StringView s) {
     StringView ipPart, portPart;
 
-    if (!s.split(':', ipPart, portPart)) {
-        raise(StringBuilder() << StringView(u8"expected ip:port, got: ") << s);
+    if (!s.empty() && s[0] == '[') {
+        StringView body = s.suffix(s.length() - 1);
+
+        if (!body.split(']', ipPart, portPart) || portPart.empty() || portPart[0] != ':') {
+            raise(StringBuilder() << StringView(u8"expected [ipv6]:port: ") << s);
+        }
+
+        portPart = portPart.suffix(portPart.length() - 1);
+    } else if (!s.split(':', ipPart, portPart)) {
+        raise(StringBuilder() << StringView(u8"expected ip:port: ") << s);
     }
 
-    u32 ip = parseIPv4(ipPart);
-    u16 port = (u16)portPart.stou();
+    char host[INET6_ADDRSTRLEN];
+    char serv[8];
+    toCStr(host, ipPart);
+    toCStr(serv, portPart);
+
+    addrinfo hints = {};
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    addrinfo* res = nullptr;
+
+    if (getaddrinfo(host, serv, &hints, &res) != 0) {
+        raise(StringBuilder() << StringView(u8"bad ip:port: ") << s);
+    }
 
     auto* ss = pool->make<sockaddr_storage>();
-    auto* sin = (sockaddr_in*)ss;
-
-    sin->sin_family = AF_INET;
-    sin->sin_port = htons(port);
-    sin->sin_addr.s_addr = htonl(ip);
+    memCpy(ss, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
 
     return (const sockaddr*)ss;
 }

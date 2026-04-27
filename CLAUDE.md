@@ -70,9 +70,10 @@ via `stl::Thread`, runs the data plane.
                          ├── plane.cpp: tunReader (per queue)
                          │     decode 10-byte virtio_net_hdr
                          │     gsoSplit on GSO_TCPV4 → N MTU segments
-                         │     for each: conn = conns->lookup(dst)
-                         │              slot = conn->next() (atomic)
-                         │              sendto(slot.srcFd, slot.dstAddr)
+                         │     split N segs into 8 parts; for each part:
+                         │       slot = conn->next() (atomic)
+                         │       sendmsg(slot.srcFd, UDP_SEGMENT, gso_size)
+                         │       → kernel/NIC re-segments to MTU
                          │
 [N UDP sockets] ── recvmmsg(64) ── plane.cpp: udpReader (per socket)
                                     write [10 zero hdr | payload] → tuns[i]
@@ -80,9 +81,11 @@ via `stl::Thread`, runs the data plane.
 
 * TX path: N OS threads, one per TUN queue. Each blocks on
   `read(tunFd)`; on GSO_TCPV4 the super-packet is split in user-space
-  via `gsoSplit` (vendored from wireguard-go), each MTU segment
-  handed to `Conn::next()` which atomically picks the next slot in
-  the per-peer N*M (srcFd × dstAddr) stripe array.
+  via `gsoSplit` (vendored from wireguard-go). The N segments are
+  partitioned into 8 chunks; each chunk is sent as one
+  `sendmsg(UDP_SEGMENT)` cmsg call through its own stripe slot, so
+  segments of one super-packet land on multiple (src,dst) pairs and
+  the kernel/NIC handles the actual MTU-sized re-segmentation.
 * RX path: N OS threads, one per UDP socket. Each blocks on
   `recvmmsg(MSG_WAITFORONE)` to drain up to 64 packets per syscall,
   then writes each to the paired TUN queue with a zeroed 10-byte
@@ -93,7 +96,8 @@ via `stl::Thread`, runs the data plane.
   ioctl path silently drops egress on a /24 P2P TUN.
 * Stripe: per-`Conn` `atomic_uint64` rr counter walks the pre-built
   N*M slot array (laid out so `rr % N` rotates src fast, `rr / N`
-  rotates dst slow — matches gofra-go's stripe formula).
+  rotates dst slow). The 8-way USO split rotates the counter 8 times
+  per super-packet, hitting all 4 srcs × 2 dsts.
 
 There's no header on the wire. The UDP payload IS the inner IP
 packet; receiver hands it to TUN with the zero virtio_net_hdr
@@ -146,12 +150,9 @@ not gofra.
 
 ## Future hooks (not built)
 
-* `UDP_SEGMENT` (USO) on TX — one `sendmsg` per super-packet with
-  cmsg, kernel/NIC segments to MTU. Drops `gsoSplit` from user-space
-  and amortizes `udp_sendmsg` / qdisc lock through the wireguard-go
-  PR #75 path. Closes the remaining gap to NIC saturation on
-  4×1G underlays.
-* `UDP_GRO` on RX — kernel coalesces incoming UDP packets into
-  super-buffers before handing to user-space; pairs with USO.
+* `UDP_GRO` on RX — kernel coalesces incoming UDP packets into a
+  super-buffer; we'd then write that as one GSO_TCPV4 frame to TUN,
+  cutting receiver-side TCP stack walks per byte. Symmetric to USO
+  on TX and the obvious next big lever.
 * Optional 4-byte header with seq/path-id for downstream dedup or
   reorder-buffer features. Capability-bit so old peers degrade.

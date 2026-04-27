@@ -9,10 +9,10 @@ and you want all four to carry traffic for one logical link without
 involving the kernel routing table or LACP.
 
 C++ on top of [std/](https://github.com/pg83/std) (ObjPool, threads,
-intrusive containers). Multi-queue TUN with `IFF_VNET_HDR` + GSO/TSO
-offload, blocking-thread data path, `recvmmsg(64)` to amortize RX
-syscalls. Single-stream TCP saturates ~3 Gbit/s on a 4×1Gbps lab
-stripe — same shape as the (now-removed) Go prototype.
+intrusive containers). Multi-queue TUN with `IFF_VNET_HDR` + GSO/TSO,
+blocking-thread data path, `recvmmsg(64)` on RX, `sendmsg(UDP_SEGMENT)`
+on TX with the super-packet split across 8 stripe slots. Single-stream
+TCP hits ~3.5 Gbit/s on a 4×1Gbps lab stripe.
 
 ## What it does
 
@@ -21,11 +21,15 @@ stripe — same shape as the (now-removed) Go prototype.
 * binds N UDP sockets, one per local underlay IP, each pinned to its
   NIC via `SO_BINDTODEVICE`.
 * per remote peer, pre-builds an N*M (srcFd × dstAddr) slot array;
-  consecutive packets walk the array via an atomic counter so traffic
-  fans out across every underlay pair.
-* on the receive side, drains each UDP socket with `recvmmsg(64)` and
-  writes each datagram (with a zeroed 10-byte virtio_net_hdr prefix)
-  to the paired TUN queue.
+  an atomic counter walks the array so traffic fans out across every
+  underlay pair.
+* TX: read the GSO super-packet from TUN, run wireguard-go's
+  `gsoSplit` (vendored), then `sendmsg(UDP_SEGMENT)` over 8 stripe
+  slots — kernel/NIC re-segments each part to MTU. RX-parallel by
+  construction.
+* RX: drain each UDP socket with `recvmmsg(64)` and write each
+  datagram (with a zeroed 10-byte virtio_net_hdr prefix) to the
+  paired TUN queue.
 
 That's the whole feature set. No replay window, no MAC, no
 authentication, no roaming. If you want any of that, run nebula.
@@ -69,7 +73,7 @@ Needs `CAP_NET_ADMIN` (TUN + rtnetlink) and `CAP_NET_RAW`
 
 ## Status
 
-~3 Gbit/s single-stream TCP over a 4×1Gbps lab stripe. Path to more:
-`UDP_SEGMENT` on TX (one sendmsg per 64KB super-packet, NIC segments
-to MTU) closes the remaining gap to NIC saturation and matches the
-wireguard-go PR #75 / Tailscale 2023 path.
+~3.5 Gbit/s single-stream TCP over a 4×1Gbps lab stripe. Next lever
+is `UDP_GRO` on RX so the kernel hands us a coalesced super-buffer
+to write to TUN as one GSO_TCPV4 frame, cutting receiver-side TCP
+stack walks per byte.

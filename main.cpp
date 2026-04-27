@@ -6,10 +6,10 @@
 // multi-queue + IFF_VNET_HDR + gsoSplit for parity with gofra1.
 
 #include "config.h"
-#include "tun.h"
-#include "socks.h"
+#include "conn.h"
 #include "peer.h"
 #include "plane.h"
+#include "tun.h"
 
 #include <std/mem/obj_pool.h>
 #include <std/thr/coro.h>
@@ -54,11 +54,16 @@ namespace {
         auto cfg = loadConfig(pool.mutPtr(), configPath);
 
         int tunFd = openTun(pool.mutPtr(), cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
-        int udpFd = openUdpSocket(pool.mutPtr(), cfg->self->dst(0), cfg->udpRecvBuf, cfg->udpSendBuf);
+
+        // ConnTable opens N=self->dstCount() UDP sockets internally
+        // and pre-builds the N*M stripe slots per remote peer.
+        auto* conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self,
+                                        cfg->udpRecvBuf, cfg->udpSendBuf);
 
         sysE << StringView(u8"gofra2: tun=") << StringView(cfg->tunDev)
              << StringView(u8" mtu=") << (u64)cfg->tunMtu
-             << StringView(u8" peers=") << (u64)cfg->peers->size()
+             << StringView(u8" srcs=") << (u64)conns->srcCount()
+             << StringView(u8" peers=") << (u64)conns->size()
              << endL;
 
         auto exec = CoroExecutor::create(pool.mutPtr(), 8);
@@ -70,12 +75,17 @@ namespace {
         constexpr size_t stackSize = 32 * 1024;
 
         exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable([&] {
-            tunReader(reactor, tunFd, udpFd, cfg->peers, cfg->tunMtu);
+            tunReader(reactor, tunFd, conns, cfg->tunMtu);
         }));
 
-        exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable([&] {
-            udpReader(reactor, udpFd, tunFd);
-        }));
+        // One udpReader per source socket — each pumps its own ring's
+        // CQEs back into the TUN.
+        for (size_t i = 0; i < conns->srcCount(); ++i) {
+            int srcFd = conns->srcFd(i);
+            exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable([reactor, srcFd, tunFd] {
+                udpReader(reactor, srcFd, tunFd);
+            }));
+        }
 
         exec->join();
         return 0;

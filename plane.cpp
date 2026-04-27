@@ -1,4 +1,5 @@
 #include "plane.h"
+#include "conn.h"
 #include "peer.h"
 
 #include <std/thr/io_reactor.h>
@@ -23,7 +24,7 @@ namespace {
     }
 }
 
-void gofra::tunReader(IoReactor* reactor, int tunFd, int udpFd, PeerTable* peers, int mtu) {
+void gofra::tunReader(IoReactor* reactor, int tunFd, ConnTable* conns, int mtu) {
     // Per-coroutine scratch. Sized for one MTU plus a bit of headroom;
     // 10 KiB upper bound covers standard 9000-byte jumbo frames + slack.
     u8 buf[10000];
@@ -51,15 +52,16 @@ void gofra::tunReader(IoReactor* reactor, int tunFd, int udpFd, PeerTable* peers
             continue;
         }
 
-        auto peer = peers->lookup(dstVip);
-        if (!peer) {
+        auto conn = conns->lookup(dstVip);
+        if (!conn) {
             continue;
         }
 
-        const sockaddr_in* dst = peer->pickDst();
+        auto slot = conn->next();
 
         size_t sent = 0;
-        err = reactor->sendto(udpFd, &sent, buf, n, (const sockaddr*)dst, sizeof(*dst), NEVER);
+        err = reactor->sendto(slot->srcFd, &sent, buf, n,
+                              (const sockaddr*)slot->dstAddr, sizeof(*slot->dstAddr), NEVER);
 
         if (err) {
             warnErrno(StringView(u8"udp sendto"), err);

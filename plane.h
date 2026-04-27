@@ -5,16 +5,16 @@ namespace stl {
 }
 
 namespace gofra {
-    class PeerTable;
+    struct ConnTable;
 
     // tunReader: read inner IP packets off `tunFd`, look up the
-    // destination peer in `peers`, RR-pick an underlay dst, and
-    // sendto via `udpFd`. Phase 1 uses a single UDP socket and a
-    // single TUN queue; later phases will fan out across N pairs.
-    void tunReader(stl::IoReactor* reactor, int tunFd, int udpFd, PeerTable* peers, int mtu);
+    // destination's Conn in `conns`, take the next stripe slot, and
+    // sendto via slot->srcFd toward slot->dstAddr. One coroutine,
+    // serializes against itself; the per-Conn counter is atomic so
+    // future multi-tunReader is safe.
+    void tunReader(stl::IoReactor* reactor, int tunFd, ConnTable* conns, int mtu);
 
     // udpReader: recvfrom on `udpFd` and write each datagram into
-    // `tunFd`. No seq prefix on the wire — the kernel TCP / SACK
-    // handles cross-NIC reorder. Phase 2 will widen this to N→N.
+    // `tunFd`. main spawns one of these per ConnTable::srcFd(i).
     void udpReader(stl::IoReactor* reactor, int udpFd, int tunFd);
 }

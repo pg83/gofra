@@ -14,13 +14,11 @@ namespace gofra {
     }
 
     // Peer: one VIP → its underlay endpoints. dst(i)/dstCount() expose
-    // the endpoints (used by the bind path on the self entry);
-    // pickDst is the hot-path RR pick from tunReader.
+    // the endpoints; the hot-path stripe lives in conn.h, not here.
     struct Peer {
         virtual u32 vip() const noexcept = 0;
         virtual size_t dstCount() const noexcept = 0;
         virtual const sockaddr_in* dst(size_t i) const noexcept = 0;
-        virtual const sockaddr_in* pickDst() noexcept = 0;
     };
 
     // PeerTable: pure cluster map, every overlay-VIP → Peer in the
@@ -29,6 +27,7 @@ namespace gofra {
     // ip:port pairs parsed at config time, no global listen_port.
     struct PeerTable {
         virtual size_t size() const noexcept = 0;
+        virtual Peer* at(size_t i) const noexcept = 0;
         virtual Peer* lookup(u32 vip) const noexcept = 0;
 
         static PeerTable* create(stl::ObjPool* pool, ini::Section* sec);

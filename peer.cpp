@@ -8,7 +8,6 @@
 #include <std/str/builder.h>
 #include <std/str/view.h>
 #include <std/sym/i_map.h>
-#include <std/sys/atomic.h>
 #include <std/sys/throw.h>
 
 #include <netinet/in.h>
@@ -40,7 +39,6 @@ namespace {
     struct PeerImpl: public Peer {
         u32 vip_;
         Vector<sockaddr_in> dsts_;
-        u64 rr_ = 0;
 
         explicit PeerImpl(u32 vip) noexcept
             : vip_(vip)
@@ -58,8 +56,6 @@ namespace {
         const sockaddr_in* dst(size_t i) const noexcept override {
             return &dsts_[i];
         }
-
-        const sockaddr_in* pickDst() noexcept override;
     };
 
     struct PeerTableImpl: public PeerTable {
@@ -70,6 +66,10 @@ namespace {
 
         size_t size() const noexcept override {
             return peers_.length();
+        }
+
+        Peer* at(size_t i) const noexcept override {
+            return peers_[i];
         }
 
         Peer* lookup(u32 vip) const noexcept override;
@@ -87,12 +87,6 @@ StringView PeerError::description() {
         .xchg(full_);
 
     return full_;
-}
-
-const sockaddr_in* PeerImpl::pickDst() noexcept {
-    u64 c = stdAtomicAddAndFetch(&rr_, (u64)1, MemoryOrder::Relaxed) - 1;
-    size_t i = (size_t)(c % dsts_.length());
-    return &dsts_[i];
 }
 
 PeerTableImpl::PeerTableImpl(ObjPool* pool, ini::Section* sec)

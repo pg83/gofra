@@ -24,9 +24,10 @@ namespace {
 }
 
 void gofra::tunReader(IoReactor* reactor, int tunFd, int udpFd, PeerTable* peers, int mtu) {
-    // Per-coroutine scratch. Sized for one MTU plus a bit of headroom.
+    // Per-coroutine scratch. Sized for one MTU plus a bit of headroom;
+    // 10 KiB upper bound covers standard 9000-byte jumbo frames + slack.
+    u8 buf[10000];
     size_t bufLen = (size_t)mtu + 128;
-    u8 buf[2048];
 
     if (bufLen > sizeof(buf)) {
         bufLen = sizeof(buf);
@@ -67,7 +68,7 @@ void gofra::tunReader(IoReactor* reactor, int tunFd, int udpFd, PeerTable* peers
 }
 
 void gofra::udpReader(IoReactor* reactor, int udpFd, int tunFd) {
-    u8 buf[2048];
+    u8 buf[10000];
 
     for (;;) {
         size_t n = 0;

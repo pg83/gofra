@@ -6,11 +6,11 @@
 #include <std/lib/buffer.h>
 #include <std/str/view.h>
 #include <std/str/builder.h>
+#include <std/sys/crt.h>
 #include <std/sys/throw.h>
 #include <std/ios/fs_utils.h>
 #include <std/dbg/verify.h>
 
-#include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
@@ -53,7 +53,7 @@ namespace {
         // inet_pton wants NUL-terminated; copy into a small buffer.
         char buf[16];
         STD_VERIFY(s.length() < sizeof(buf));
-        memcpy(buf, s.data(), s.length());
+        memCpy(buf, s.data(), s.length());
         buf[s.length()] = 0;
 
         in_addr a;
@@ -109,7 +109,7 @@ namespace {
     // Copy `s` into pool-allocated NUL-terminated storage.
     const char* internCStr(ObjPool* pool, StringView s) {
         char* d = (char*)pool->allocate(s.length() + 1);
-        memcpy(d, s.data(), s.length());
+        memCpy(d, s.data(), s.length());
         d[s.length()] = 0;
         return d;
     }
@@ -117,7 +117,7 @@ namespace {
     enum class Section { Top, Me, Peer, Udp };
 }
 
-Config* gofra::loadConfig(ObjPool* pool, const char* path) {
+Config* gofra::loadConfig(ObjPool* pool, StringView path) {
     auto cfg = pool->make<Config>();
 
     cfg->listenPort = 0;
@@ -129,7 +129,7 @@ Config* gofra::loadConfig(ObjPool* pool, const char* path) {
     cfg->udpSendBuf = 16 << 20;
 
     Buffer pathBuf;
-    pathBuf.append(path, strlen(path));
+    pathBuf.append(path.data(), path.length());
 
     Buffer fileBuf;
     readFileContent(pathBuf, fileBuf);

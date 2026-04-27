@@ -7,6 +7,7 @@
 
 namespace stl {
     class ObjPool;
+    class StringView;
 }
 
 namespace gofra {
@@ -17,7 +18,7 @@ namespace gofra {
         u32 tunVip;       // inner IPv4 of `me` (host byte order)
         u8 tunPrefixLen;  // CIDR prefix
         int tunMtu;
-        const char* tunDev;
+        const char* tunDev;  // NUL-terminated; copied into ifr_name for ioctls
 
         stl::Vector<sockaddr_in> underlay;  // local underlay addrs (port = listenPort)
         stl::Vector<Peer*> peers;
@@ -26,5 +27,5 @@ namespace gofra {
         int udpSendBuf;
     };
 
-    Config* loadConfig(stl::ObjPool* pool, const char* path);
+    Config* loadConfig(stl::ObjPool* pool, stl::StringView path);
 }

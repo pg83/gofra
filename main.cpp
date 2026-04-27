@@ -13,13 +13,11 @@
 
 #include <std/mem/obj_pool.h>
 #include <std/thr/coro.h>
-#include <std/thr/io_uring.h>
 #include <std/thr/io_reactor.h>
 #include <std/sys/throw.h>
 #include <std/str/view.h>
 #include <std/ios/sys.h>
 
-#include <string.h>
 #include <stdlib.h>
 #include <signal.h>
 
@@ -33,17 +31,19 @@ namespace {
     }
 
     int run(int argc, char** argv) {
-        const char* configPath = nullptr;
+        StringView configPath;
 
         for (int i = 1; i < argc; ++i) {
-            if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
-                configPath = argv[++i];
+            StringView arg(argv[i]);
+
+            if (arg == StringView(u8"--config") && i + 1 < argc) {
+                configPath = StringView(argv[++i]);
             } else {
                 usage();
             }
         }
 
-        if (!configPath) {
+        if (configPath.empty()) {
             usage();
         }
 
@@ -64,16 +64,21 @@ namespace {
         auto peers = pool->make<PeerTable>(pool.mutPtr());
         peers->load(*cfg);
 
-        auto exec = CoroExecutor::create(pool.mutPtr(), 2);
-        auto reactor = createIoUringReactor(pool.mutPtr(), exec, 2);
+        auto exec = CoroExecutor::create(pool.mutPtr(), 8);
+        auto reactor = exec->io();
 
-        exec->spawn([&] {
+        // 32 KiB stack: tunReader / udpReader carry a 10 KiB packet buffer
+        // on the coroutine stack and call into io_uring + std/ formatting
+        // helpers, which together can use a few KiB of frame space.
+        constexpr size_t stackSize = 32 * 1024;
+
+        exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable([&] {
             tunReader(reactor, tunFd, udpFd, peers, cfg->tunMtu);
-        });
+        }));
 
-        exec->spawn([&] {
+        exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable([&] {
             udpReader(reactor, udpFd, tunFd);
-        });
+        }));
 
         exec->join();
         return 0;

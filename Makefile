@@ -15,7 +15,7 @@ OBJS = $(SRCS:%.cpp=%.cpp.o)
 
 OPTF = -O2 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
 CXXF = -I. -I$(STDDIR) -W -Wall -std=c++26 $(OPTF) $(CPPFLAGS) $(CFLAGS) $(CXXFLAGS) $(EXTRA)
-LDF  = -L$(STDDIR)/std $(LDFLAGS) -lstd
+LDF  = -L$(STDDIR)/std $(LDFLAGS) -lstd -lmnl
 
 all: gofra2
 

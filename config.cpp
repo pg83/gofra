@@ -1,4 +1,5 @@
 #include "config.h"
+#include "ini.h"
 #include "peer.h"
 
 #include <std/mem/obj_pool.h>
@@ -6,6 +7,7 @@
 #include <std/lib/buffer.h>
 #include <std/str/view.h>
 #include <std/str/builder.h>
+#include <std/sym/s_map.h>
 #include <std/sys/crt.h>
 #include <std/sys/throw.h>
 #include <std/ios/fs_utils.h>
@@ -84,8 +86,6 @@ namespace {
         return sa;
     }
 
-    // Walk a comma-separated list, calling `cb(item)` on each
-    // non-empty trimmed segment.
     template <typename F>
     void forEachItem(StringView s, F cb) {
         while (!s.empty()) {
@@ -106,7 +106,6 @@ namespace {
         }
     }
 
-    // Copy `s` into pool-allocated NUL-terminated storage.
     const char* internCStr(ObjPool* pool, StringView s) {
         char* d = (char*)pool->allocate(s.length() + 1);
         memCpy(d, s.data(), s.length());
@@ -114,7 +113,68 @@ namespace {
         return d;
     }
 
-    enum class Section { Top, Me, Peer, Udp };
+    // ---- typed extraction over an ini::Section ----
+
+    StringView require(ini::Section* sec, StringView key, StringView ctx) {
+        auto* v = sec->map.find(key);
+        if (!v) {
+            raise(StringBuilder() << ctx << StringView(u8".") << key << StringView(u8" missing"));
+        }
+        return *v;
+    }
+
+    void loadTop(Config* cfg, ini::Section* sec) {
+        if (auto* v = sec->map.find(StringView(u8"listen_port")); v) {
+            cfg->listenPort = (u16)v->stou();
+        }
+        // log_level: accepted, currently ignored
+    }
+
+    void loadMe(ObjPool* pool, Config* cfg, ini::Section* sec) {
+        forEachItem(require(sec, StringView(u8"underlay"), StringView(u8"me")), [&](StringView it) {
+            cfg->underlay.pushBack(makeAddr(parseIPv4(it), 0));
+        });
+
+        if (auto* v = sec->map.find(StringView(u8"tun_dev")); v) {
+            cfg->tunDev = internCStr(pool, *v);
+        }
+        if (auto* v = sec->map.find(StringView(u8"tun_mtu")); v) {
+            cfg->tunMtu = (int)v->stou();
+        }
+
+        parseCIDR(require(sec, StringView(u8"tun_vip"), StringView(u8"me")),
+                  &cfg->tunVip, &cfg->tunPrefixLen);
+    }
+
+    void loadPeers(ObjPool* pool, Config* cfg, ini::Section* sec) {
+        for (size_t i = 0; i < sec->keys.length(); ++i) {
+            StringView vipStr = sec->keys[i];
+            StringView dstStr = *sec->map.find(vipStr);
+
+            auto peer = pool->make<Peer>();
+            u8 plen;
+            parseCIDR(vipStr, &peer->vip, &plen);
+
+            forEachItem(dstStr, [&](StringView it) {
+                peer->dsts.pushBack(makeAddr(parseIPv4(it), 0));
+            });
+
+            if (peer->dsts.length() == 0) {
+                raise(StringBuilder() << StringView(u8"peer ") << vipStr << StringView(u8" has no dsts"));
+            }
+
+            cfg->peers.pushBack(peer);
+        }
+    }
+
+    void loadUdp(Config* cfg, ini::Section* sec) {
+        if (auto* v = sec->map.find(StringView(u8"recv_buf")); v) {
+            cfg->udpRecvBuf = (int)v->stou();
+        }
+        if (auto* v = sec->map.find(StringView(u8"send_buf")); v) {
+            cfg->udpSendBuf = (int)v->stou();
+        }
+    }
 }
 
 Config* gofra::loadConfig(ObjPool* pool, StringView path) {
@@ -134,98 +194,24 @@ Config* gofra::loadConfig(ObjPool* pool, StringView path) {
     Buffer fileBuf;
     readFileContent(pathBuf, fileBuf);
 
-    StringView text = fileBuf;
-    Section section = Section::Top;
+    auto* ini = ini::parseConfig(pool, fileBuf);
 
-    while (!text.empty()) {
-        StringView line, rest;
+    if (auto* sec = ini->find(StringView()); sec) {
+        loadTop(cfg, sec);
+    }
 
-        if (!text.split('\n', line, rest)) {
-            line = text;
-            rest = StringView();
-        }
+    if (auto* sec = ini->find(StringView(u8"me")); sec) {
+        loadMe(pool, cfg, sec);
+    } else {
+        raise(StringBuilder() << StringView(u8"missing [me] section"));
+    }
 
-        line = line.stripSpace();
-        text = rest;
+    if (auto* sec = ini->find(StringView(u8"peer")); sec) {
+        loadPeers(pool, cfg, sec);
+    }
 
-        if (line.empty() || line[0] == '#' || line[0] == ';') {
-            continue;
-        }
-
-        if (line[0] == '[') {
-            if (line.back() != ']') {
-                raise(StringBuilder() << StringView(u8"bad section: ") << line);
-            }
-
-            StringView sec = line.suffix(line.length() - 1).prefix(line.length() - 2).stripSpace();
-
-            if (sec == StringView(u8"me")) {
-                section = Section::Me;
-            } else if (sec == StringView(u8"peer")) {
-                section = Section::Peer;
-            } else if (sec == StringView(u8"udp")) {
-                section = Section::Udp;
-            } else {
-                raise(StringBuilder() << StringView(u8"unknown section: ") << sec);
-            }
-
-            continue;
-        }
-
-        StringView key, val;
-        if (!line.split('=', key, val)) {
-            raise(StringBuilder() << StringView(u8"missing '=': ") << line);
-        }
-
-        key = key.stripSpace();
-        val = val.stripSpace();
-
-        if (section == Section::Top) {
-            if (key == StringView(u8"listen_port")) {
-                cfg->listenPort = (u16)val.stou();
-            } else if (key == StringView(u8"log_level")) {
-                // accepted, currently ignored
-            } else {
-                raise(StringBuilder() << StringView(u8"unknown top key: ") << key);
-            }
-        } else if (section == Section::Me) {
-            if (key == StringView(u8"underlay")) {
-                forEachItem(val, [&](StringView it) {
-                    cfg->underlay.pushBack(makeAddr(parseIPv4(it), 0));
-                });
-            } else if (key == StringView(u8"tun_dev")) {
-                cfg->tunDev = internCStr(pool, val);
-            } else if (key == StringView(u8"tun_mtu")) {
-                cfg->tunMtu = (int)val.stou();
-            } else if (key == StringView(u8"tun_vip")) {
-                parseCIDR(val, &cfg->tunVip, &cfg->tunPrefixLen);
-            } else {
-                raise(StringBuilder() << StringView(u8"unknown me key: ") << key);
-            }
-        } else if (section == Section::Peer) {
-            // [peer] section: key is the peer VIP, val is comma-list of dsts
-            auto peer = pool->make<Peer>();
-            u8 plen;
-            parseCIDR(key, &peer->vip, &plen);
-
-            forEachItem(val, [&](StringView it) {
-                peer->dsts.pushBack(makeAddr(parseIPv4(it), 0));
-            });
-
-            if (peer->dsts.length() == 0) {
-                raise(StringBuilder() << StringView(u8"peer ") << key << StringView(u8" has no dsts"));
-            }
-
-            cfg->peers.pushBack(peer);
-        } else if (section == Section::Udp) {
-            if (key == StringView(u8"recv_buf")) {
-                cfg->udpRecvBuf = (int)val.stou();
-            } else if (key == StringView(u8"send_buf")) {
-                cfg->udpSendBuf = (int)val.stou();
-            } else {
-                raise(StringBuilder() << StringView(u8"unknown udp key: ") << key);
-            }
-        }
+    if (auto* sec = ini->find(StringView(u8"udp")); sec) {
+        loadUdp(cfg, sec);
     }
 
     if (cfg->listenPort == 0) {

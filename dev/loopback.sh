@@ -1,22 +1,22 @@
 #!/bin/sh
-# Smoke test: build gofra2 locally, ship it to lab1 via ssh, run
-# one instance on each side, exercise the overlay with iperf3, and
-# leave both gofra2 instances running with their logs streaming to
-# stdout until Ctrl-C / subreaper-driven teardown.
+# Smoke test over Ethernet (no nebula). Local has one NIC at
+# 10.0.0.163; lab2 has four NICs at 10.0.0.68..71. peers[lab2.vip]
+# lists all four lab2 underlays, so the stripe is 1×4 from local
+# (one local src) and 4×1 from lab2 (four local srcs, one remote).
 #
-# No netns, no veth — the underlay is just nebula between the dev
-# machine and lab1. No manual cleanup either: subreaper kills our
-# children on exit, ssh disconnect SIGHUPs the remote gofra2, and
-# the TUN device is non-persistent so it disappears with the
-# process. Lab1 side files land in $HOME/gofra2-smoke/ (no /tmp on
-# stalix).
+# No netns, no veth — direct UDP over Ethernet. ssh stays over
+# nebula; only the gofra2 underlay traffic uses eth. No manual
+# cleanup either: subreaper kills our children on exit, ssh
+# disconnect SIGHUPs the remote gofra2, and the TUN device is
+# non-persistent so it disappears with the process. Lab2 side
+# files land in $HOME/gofra2-smoke/ (no /tmp on stalix).
 #
 # Layout:
-#   local: gofra2 bound to $LOCAL_UNDERLAY:$PORT, vip 192.168.110.1/24
-#   lab1:  gofra2 bound to $LAB1_UNDERLAY:$PORT,  vip 192.168.110.2/24
+#   local: vip 192.168.110.1/24, underlay 10.0.0.163:$PORT
+#   lab2:  vip 192.168.110.2/24, underlays 10.0.0.{68,69,70,71}:$PORT
 #
 # Custom port and TUN name so we don't stomp on the deployed
-# cluster gofra2 (port 8050, dev gofra20).
+# cluster gofra2.
 #
 # Usage:
 #   sudo subreaper sh dev/loopback.sh             # 10s TCP
@@ -28,13 +28,12 @@ set -xu
 export PATH=/ix/realm/llm/bin:$PATH
 
 GOFRA2=${GOFRA2:-./gofra2}
-LAB1_HOST=lab1.nebula
-LAB1_UNDERLAY=192.168.100.16
-LOCAL_UNDERLAY=192.168.100.64    # this dev machine's nebula IP — edit if it moves
+LAB_SSH=lab2.nebula              # ssh over nebula; underlay traffic uses eth
+LOCAL_UNDERLAY=10.0.0.163        # this dev machine's eth1 IP
 PORT=8060
 TUN=gofra2_smoke
 LOCAL_VIP=192.168.110.1
-LAB1_VIP=192.168.110.2
+LAB_VIP=192.168.110.2
 
 # Local scratch (real /tmp here). Lab side lands in $HOME (no /tmp
 # on stalix); SSH_DIR is referenced as a path RELATIVE to whatever
@@ -50,30 +49,34 @@ udp_b=${3:-1G}
 
 mkdir -p "$TMP"
 
+# Both sides see the same [peers] table — only [me].vip differs.
+PEERS_BLOCK=$(cat <<EOF
+[peers]
+$LOCAL_VIP = 10.0.0.163:$PORT
+$LAB_VIP   = 10.0.0.68:$PORT, 10.0.0.69:$PORT, 10.0.0.70:$PORT, 10.0.0.71:$PORT
+EOF
+)
+
 cat > "$TMP/local.ini" <<EOF
 [me]
 vip     = $LOCAL_VIP/24
 tun_dev = $TUN
 tun_mtu = 1280
 
-[peers]
-$LOCAL_VIP = $LOCAL_UNDERLAY:$PORT
-$LAB1_VIP  = $LAB1_UNDERLAY:$PORT
+$PEERS_BLOCK
 
 [udp]
 recv_buf = 16777216
 send_buf = 16777216
 EOF
 
-cat > "$TMP/lab1.ini" <<EOF
+cat > "$TMP/lab.ini" <<EOF
 [me]
-vip     = $LAB1_VIP/24
+vip     = $LAB_VIP/24
 tun_dev = $TUN
 tun_mtu = 1280
 
-[peers]
-$LOCAL_VIP = $LOCAL_UNDERLAY:$PORT
-$LAB1_VIP  = $LAB1_UNDERLAY:$PORT
+$PEERS_BLOCK
 
 [udp]
 recv_buf = 16777216
@@ -82,20 +85,19 @@ EOF
 
 SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
-echo "=== underlay: local=$LOCAL_UNDERLAY  lab1=$LAB1_UNDERLAY ==="
+echo "=== underlay: local=$LOCAL_UNDERLAY  lab=10.0.0.{68,69,70,71} ==="
 
-ssh $SSH_OPTS "root@$LAB1_HOST" "mkdir -p $SSH_DIR"
-ssh $SSH_OPTS "root@$LAB1_HOST" "cat > $SSH_DIR/gofra2 && chmod +x $SSH_DIR/gofra2" < "$GOFRA2"
-ssh $SSH_OPTS "root@$LAB1_HOST" "cat > $SSH_DIR/lab1.ini" < "$TMP/lab1.ini"
+ssh $SSH_OPTS "root@$LAB_SSH" "mkdir -p $SSH_DIR"
+ssh $SSH_OPTS "root@$LAB_SSH" "cat > $SSH_DIR/gofra2 && chmod +x $SSH_DIR/gofra2" < "$GOFRA2"
+ssh $SSH_OPTS "root@$LAB_SSH" "cat > $SSH_DIR/lab.ini" < "$TMP/lab.ini"
 
-# Lab1 gofra2 over a held-open ssh; channel close → SIGHUP → exit.
-# `-T` (no pty) + line-buffered redirect via `stdbuf` keep startup
-# log lines from sitting in a pipe block buffer; otherwise the
-# initial "gofra2: tun=..." line takes ages to surface and looks
-# like a hang.
-ssh $SSH_OPTS -T "root@$LAB1_HOST" \
-    "exec $SSH_DIR/gofra2 --config $SSH_DIR/lab1.ini 2>&1" \
-    | sed -u 's/^/[lab1] /' &
+# Lab gofra2 over a held-open ssh; channel close → SIGHUP → exit.
+# `-T` (no pty) keeps startup log lines from sitting in a pipe
+# block buffer; otherwise the initial "gofra2: tun=..." line takes
+# ages to surface and looks like a hang.
+ssh $SSH_OPTS -T "root@$LAB_SSH" \
+    "exec $SSH_DIR/gofra2 --config $SSH_DIR/lab.ini 2>&1" \
+    | sed -u 's/^/[lab] /' &
 
 # Local gofra2.
 "$GOFRA2" --config "$TMP/local.ini" &
@@ -104,11 +106,11 @@ sleep 1
 
 # ssh runs commands with stalix's busybox-only PATH; iproute2's
 # full `ip` lives at the realm path (see feedback memory).
-LAB1_IP=/ix/realm/ip/bin/ip
+LAB_IP=/ix/realm/ip/bin/ip
 
 echo "=== route + iface state ==="
-echo "--- local: route to $LAB1_VIP ---"
-ip route get "$LAB1_VIP" || :
+echo "--- local: route to $LAB_VIP ---"
+ip route get "$LAB_VIP" || :
 echo "--- local: ip rule (policy routing) ---"
 ip rule show || :
 echo "--- local: rp_filter / accept_local on $TUN ---"
@@ -120,30 +122,30 @@ echo "--- local: nft ruleset ---"
 nft list ruleset 2>&1 | head -20 || :
 echo "--- local: $TUN ---"
 ip -s -s link show "$TUN" || :
-echo "--- lab1: route to $LOCAL_VIP ---"
-ssh $SSH_OPTS "root@$LAB1_HOST" "$LAB1_IP route get $LOCAL_VIP" || :
-echo "--- lab1: $TUN ---"
-ssh $SSH_OPTS "root@$LAB1_HOST" "$LAB1_IP -s -s link show $TUN" || :
+echo "--- lab: route to $LOCAL_VIP ---"
+ssh $SSH_OPTS "root@$LAB_SSH" "$LAB_IP route get $LOCAL_VIP" || :
+echo "--- lab: $TUN ---"
+ssh $SSH_OPTS "root@$LAB_SSH" "$LAB_IP -s -s link show $TUN" || :
 
 echo "=== ping smoke ==="
-ping -c 5 -W 2 "$LAB1_VIP" || echo "(ping failed)"
+ping -c 5 -W 2 "$LAB_VIP" || echo "(ping failed)"
 
 echo "=== iface state after ping ==="
 echo "--- local: $TUN ---"
 ip -s -s link show "$TUN" || :
-echo "--- lab1: $TUN ---"
-ssh $SSH_OPTS "root@$LAB1_HOST" "$LAB1_IP -s -s link show $TUN" || :
+echo "--- lab: $TUN ---"
+ssh $SSH_OPTS "root@$LAB_SSH" "$LAB_IP -s -s link show $TUN" || :
 
-echo "=== iperf3 server on lab1 ==="
-ssh $SSH_OPTS -T "root@$LAB1_HOST" \
-    "exec iperf3 -s -B $LAB1_VIP -p 5201 2>&1" \
-    | sed -u "s/^/[iperf3 lab1] /" &
+echo "=== iperf3 server on lab ==="
+ssh $SSH_OPTS -T "root@$LAB_SSH" \
+    "exec iperf3 -s -B $LAB_VIP -p 5201 2>&1" \
+    | sed -u "s/^/[iperf3 lab] /" &
 sleep 0.5
 
 echo "=== iperf3 client (mode=$mode duration=${secs}s) ==="
 case "$mode" in
-    tcp) iperf3 -c "$LAB1_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" || true ;;
-    udp) iperf3 -c "$LAB1_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" -u -b "$udp_b" || true ;;
+    tcp) iperf3 -c "$LAB_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" || true ;;
+    udp) iperf3 -c "$LAB_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" -u -b "$udp_b" || true ;;
     *)   echo "mode must be tcp|udp" >&2; exit 1 ;;
 esac
 

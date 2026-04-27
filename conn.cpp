@@ -56,6 +56,7 @@ namespace {
 const ConnSlot* ConnImpl::next() noexcept {
     u64 c = stdAtomicAddAndFetch(&rr_, (u64)1, MemoryOrder::Relaxed) - 1;
     size_t i = (size_t)(c % slots_.length());
+
     return &slots_[i];
 }
 
@@ -92,6 +93,7 @@ ConnTableImpl::ConnTableImpl(ObjPool* pool, PeerTable* peers, Peer* self, int rc
                     srcFds_[i],
                     p->dst(j),
                 };
+
                 conn->slots_.pushBack(s);
             }
         }

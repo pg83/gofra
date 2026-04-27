@@ -67,9 +67,11 @@ namespace {
         // Iface-level mtu/addr/up runs once after all queues attach.
         size_t n = conns->srcCount();
         Vector<int> tunFds;
+
         for (size_t i = 0; i < n; ++i) {
             tunFds.pushBack(openTun(pool.mutPtr(), cfg->tunDev));
         }
+
         configureTun(cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
 
         sysE << StringView(u8"gofra2: tun=") << StringView(cfg->tunDev)
@@ -93,6 +95,7 @@ namespace {
             auto* tr = makeRunablePtr([tunFd, conns, ts] {
                 tunReader(tunFd, conns, ts);
             });
+
             auto* ur = makeRunablePtr([srcFd, tunFd, us] {
                 udpReader(srcFd, tunFd, us);
             });

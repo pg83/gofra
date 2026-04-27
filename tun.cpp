@@ -8,16 +8,18 @@
 #include <std/sys/fd.h>
 #include <std/sys/throw.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <errno.h>
+#include <arpa/inet.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
+
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <linux/rtnetlink.h>
+
 #include <libmnl/libmnl.h>
 
 using namespace stl;
@@ -130,27 +132,31 @@ void Netlink::run(nlmsghdr* nh, StringView what) {
     }
 
     alignas(u32) char rbuf[NL_BUF];
+
     ssize_t n = mnl_socket_recvfrom(nl, rbuf, sizeof(rbuf));
+
     if (n < 0) {
-        Errno().raise(StringBuilder() << what
-                      << StringView(u8": mnl_socket_recvfrom"));
+        Errno().raise(StringBuilder() << what << StringView(u8": mnl_socket_recvfrom"));
     }
 
     int rc = mnl_cb_run(rbuf, (size_t)n, nh->nlmsg_seq, portId, nullptr, nullptr);
+
     if (rc < 0) {
-        Errno().raise(StringBuilder() << what
-                      << StringView(u8": netlink ack"));
+        Errno().raise(StringBuilder() << what << StringView(u8": netlink ack"));
     }
 }
 
 void Netlink::setMtu(int idx, int mtu) {
     alignas(u32) char buf[NL_BUF];
+
     nlmsghdr* nh = mnl_nlmsg_put_header(buf);
+
     nh->nlmsg_type = RTM_NEWLINK;
     nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
     nh->nlmsg_seq = nextSeq();
 
     ifinfomsg* ifi = (ifinfomsg*)mnl_nlmsg_put_extra_header(nh, sizeof(ifinfomsg));
+
     ifi->ifi_family = AF_UNSPEC;
     ifi->ifi_index = idx;
     ifi->ifi_flags = 0;
@@ -210,6 +216,7 @@ void Netlink::linkUp(int idx) {
 
 int gofra::openTun(ObjPool* pool, const char* dev) {
     int fd = ::open("/dev/net/tun", O_RDWR | O_CLOEXEC);
+
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"open /dev/net/tun"));
     }
@@ -230,6 +237,7 @@ int gofra::openTun(ObjPool* pool, const char* dev) {
     // can advertise the 12-byte virtio_net_hdr_v1; gso.cpp's struct
     // assumes 10).
     int hdrSize = 10;
+
     if (ioctl(fd, TUNSETVNETHDRSZ, &hdrSize) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETVNETHDRSZ ") << StringView(dev));
     }
@@ -239,6 +247,7 @@ int gofra::openTun(ObjPool* pool, const char* dev) {
     // pay the per-packet syscall overhead, and the multi-NIC stripe
     // shreds TCP order. This is the whole point of phase 2.
     unsigned long off = TUN_F_CSUM | TUN_F_TSO4;
+
     if (ioctl(fd, TUNSETOFFLOAD, off) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETOFFLOAD ") << StringView(dev));
     }

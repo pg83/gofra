@@ -121,6 +121,7 @@ PeerTableImpl::PeerTableImpl(ObjPool* pool, ini::Section* sec)
 
 Peer* PeerTableImpl::lookup(u32 vip) const noexcept {
     auto found = byVip_.find(vip);
+
     return found ? *found : nullptr;
 }
 

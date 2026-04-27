@@ -61,6 +61,7 @@ u64 gofra::checksumNoFold(const u8* data, size_t len, u64 initial) noexcept {
     u64 lo = (u64)ac;
     u64 hi = (u64)(ac >> 64);
     u64 sum = lo + hi;
+
     if (sum < lo) {
         ++sum;
     }

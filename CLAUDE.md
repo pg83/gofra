@@ -12,6 +12,50 @@
 - Avoid includes in headers; prefer forward declarations. Only include in `.cpp` files.
 - Type aliases: `i8`/`u8`/`i16`/`u16`/`i32`/`u32`/`i64`/`u64` from `std/sys/types.h`.
 
+## Formatting
+
+### Blank lines around control blocks
+
+Before `if`, `for`, `while`, `switch`, `return` — add a blank line.
+Exception: no blank line if the statement is the first or last
+inside `{}`.
+
+Same rule applies after a control block: a blank line before the
+next statement, unless the block is the last thing in `{}`.
+
+```cpp
+size_t n = conns->srcCount();
+
+if (!n) {
+    return;                        // first stmt, no blank before
+}
+
+Vector<int> tunFds;                // blank line before tunFds…
+                                   // (printed by the formatter)
+for (size_t i = 0; i < n; ++i) {
+    tunFds.pushBack(openTun(...));
+}
+
+configureTun(...);                 // blank before next stmt after for
+```
+
+### Logical grouping
+
+Consecutive one-liners that form a single logical operation stay
+together without blank lines (mem-init lists, paired `setsockopt`
+calls, a chain of attribute fills before one `run()`). Between
+distinct operations — add a blank line.
+
+```cpp
+ifr.ifr_family = AF_UNSPEC;        // one operation: fill ifr fields
+ifr.ifr_index  = idx;
+ifr.ifr_flags  = 0;
+
+mnl_attr_put_u32(nh, IFLA_MTU, mtu);   // distinct: queue an attr
+
+run(nh, "RTM_NEWLINK MTU");        // distinct: send the request
+```
+
 ## Mental model
 
 C++ daemon on top of `std/`. `main.cpp` parses flags, loads the INI

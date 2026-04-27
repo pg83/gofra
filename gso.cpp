@@ -81,7 +81,9 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
     // start from a clean slate.
     in[10] = 0;
     in[11] = 0;
+
     const size_t transportCsumAt = (size_t)hdr.csumStart + (size_t)hdr.csumOffset;
+
     in[transportCsumAt] = 0;
     in[transportCsumAt + 1] = 0;
 
@@ -96,12 +98,14 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
         }
 
         size_t nextEnd = nextDataAt + (size_t)hdr.gsoSize;
+
         if (nextEnd > inLen) {
             nextEnd = inLen;
         }
 
         const size_t segDataLen = nextEnd - nextDataAt;
         const size_t totalLen = hdrTotal + segDataLen;
+
         outSizes[i] = totalLen;
 
         u8* out = outBufs[i];

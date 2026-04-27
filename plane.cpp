@@ -174,8 +174,8 @@ void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
         // recvmmsg drains up to BATCH packets in one syscall;
         // MSG_WAITFORONE blocks until at least one is available,
         // then reaps everything else already queued.
-        int n = ::recvmmsg(udpFd, sc->msgs, UdpReaderScratch::BATCH,
-                           MSG_WAITFORONE, nullptr);
+        int n = ::recvmmsg(udpFd, sc->msgs, UdpReaderScratch::BATCH, MSG_WAITFORONE, nullptr);
+
         if (n < 0) {
             warnErrno(StringView(u8"udp recvmmsg"), errno);
             continue;
@@ -183,6 +183,7 @@ void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
 
         for (int i = 0; i < n; ++i) {
             u32 payloadLen = sc->msgs[i].msg_len;
+
             if (payloadLen < 20) {
                 continue;
             }
@@ -193,8 +194,8 @@ void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
             sc->msgs[i].msg_hdr.msg_namelen = sizeof(sc->addrs[i]);
 
             // [10 B virtio_net_hdr (zeroed once at scratch ctor) | payload].
-            ssize_t w = ::write(tunFd, sc->bufs[i],
-                                VIRTIO_NET_HDR_LEN + payloadLen);
+            ssize_t w = ::write(tunFd, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen);
+
             if (w < 0) {
                 warnErrno(StringView(u8"tun write"), errno);
             }

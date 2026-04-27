@@ -54,6 +54,7 @@ u32 gofra::parseIPv4(StringView s) {
     buf[s.length()] = 0;
 
     in_addr a;
+
     if (inet_pton(AF_INET, buf, &a) != 1) {
         raise(StringBuilder() << StringView(u8"bad ipv4: ") << s);
     }
@@ -75,9 +76,11 @@ void gofra::parseCIDR(StringView s, u32* addr, u8* prefixLen) {
 
 sockaddr_in gofra::makeAddr(u32 ip, u16 port) {
     sockaddr_in sa = {};
+
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
     sa.sin_addr.s_addr = htonl(ip);
+
     return sa;
 }
 

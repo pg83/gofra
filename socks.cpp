@@ -26,6 +26,7 @@ namespace {
     // terminated, length <= IFNAMSIZ-1) and returns the length.
     size_t ifaceFor(u32 addr_ne, char out[IFNAMSIZ]) {
         ifaddrs* ifs = nullptr;
+
         if (getifaddrs(&ifs) != 0) {
             Errno().raise(StringBuilder() << StringView(u8"getifaddrs"));
         }
@@ -39,14 +40,18 @@ namespace {
             }
 
             sockaddr_in* sa = (sockaddr_in*)p->ifa_addr;
+
             if (sa->sin_addr.s_addr == addr_ne) {
                 StringView name(p->ifa_name);
+
                 if (name.length() >= IFNAMSIZ) {
                     name = name.prefix(IFNAMSIZ - 1);
                 }
+
                 memCpy(out, name.data(), name.length());
                 out[name.length()] = 0;
                 outLen = name.length();
+
                 break;
             }
         }
@@ -55,7 +60,9 @@ namespace {
 
         if (!outLen) {
             char buf[INET_ADDRSTRLEN] = {0};
+
             inet_ntop(AF_INET, &addr_ne, buf, sizeof(buf));
+
             Errno(0).raise(StringBuilder()
                            << StringView(u8"no iface owns ")
                            << StringView(buf));
@@ -75,6 +82,7 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int 
     // Blocking socket — udpReader pthreads block on recvmmsg with
     // MSG_WAITFORONE; non-blocking would just spin EAGAIN.
     int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"socket(UDP)"));
     }
@@ -85,6 +93,7 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int 
     pool->make<ScopedFD>(fd);
 
     char ifname[IFNAMSIZ];
+
     size_t ifnameLen = ifaceFor(src->sin_addr.s_addr, ifname);
 
     if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, ifnameLen) < 0) {
@@ -95,13 +104,16 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int 
     setBufForce(fd, SO_SNDBUFFORCE, sndBuf, StringView(u8"SO_SNDBUFFORCE"));
 
     int yes = 1;
+
     if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"SO_REUSEADDR"));
     }
 
     if (::bind(fd, (sockaddr*)src, sizeof(*src)) < 0) {
         char buf[INET_ADDRSTRLEN] = {0};
+
         inet_ntop(AF_INET, &src->sin_addr, buf, sizeof(buf));
+
         Errno().raise(StringBuilder()
                       << StringView(u8"bind ")
                       << StringView(buf)

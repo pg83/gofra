@@ -47,9 +47,11 @@ namespace {
 
     StringView require(ini::Section* sec, StringView key, StringView ctx) {
         auto* v = sec->map.find(key);
+
         if (!v) {
             raise(StringBuilder() << ctx << StringView(u8".") << key << StringView(u8" missing"));
         }
+
         return *v;
     }
 
@@ -60,6 +62,7 @@ namespace {
         if (auto* v = sec->map.find(StringView(u8"tun_dev")); v) {
             cfg->tunDev = internCStr(pool, *v);
         }
+
         if (auto* v = sec->map.find(StringView(u8"tun_mtu")); v) {
             cfg->tunMtu = (int)v->stou();
         }
@@ -69,6 +72,7 @@ namespace {
         if (auto* v = sec->map.find(StringView(u8"recv_buf")); v) {
             cfg->udpRecvBuf = (int)v->stou();
         }
+
         if (auto* v = sec->map.find(StringView(u8"send_buf")); v) {
             cfg->udpSendBuf = (int)v->stou();
         }

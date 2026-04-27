@@ -2,10 +2,8 @@
 #include "addr.h"
 
 #include <std/sys/fd.h>
-#include <std/sys/crt.h>
 #include <std/str/view.h>
 #include <std/sys/throw.h>
-#include <std/lib/buffer.h>
 #include <std/str/builder.h>
 #include <std/mem/obj_pool.h>
 
@@ -20,15 +18,25 @@
 using namespace stl;
 
 namespace {
-    // SO_BINDTODEVICE: TX must leave on the NIC owning src, not what routing picks.
-    StringView ifaceFor(u32 addr_ne, Buffer& buf) {
+    struct IfAddrs {
         ifaddrs* ifs = nullptr;
 
-        if (getifaddrs(&ifs) != 0) {
+        ~IfAddrs() noexcept {
+            if (ifs) {
+                freeifaddrs(ifs);
+            }
+        }
+    };
+
+    // SO_BINDTODEVICE: TX must leave on the NIC owning src, not what routing picks.
+    StringView ifaceFor(ObjPool* pool, u32 addr_ne) {
+        auto* holder = pool->make<IfAddrs>();
+
+        if (getifaddrs(&holder->ifs) != 0) {
             Errno().raise(StringBuilder() << StringView(u8"getifaddrs"));
         }
 
-        for (ifaddrs* p = ifs; p; p = p->ifa_next) {
+        for (ifaddrs* p = holder->ifs; p; p = p->ifa_next) {
             if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) {
                 continue;
             }
@@ -42,25 +50,17 @@ namespace {
                     name = name.prefix(IFNAMSIZ - 1);
                 }
 
-                buf.append(name.data(), name.length());
-
-                break;
+                return name;
             }
         }
 
-        freeifaddrs(ifs);
+        char tmp[INET_ADDRSTRLEN] = {0};
 
-        if (buf.empty()) {
-            char tmp[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &addr_ne, tmp, sizeof(tmp));
 
-            inet_ntop(AF_INET, &addr_ne, tmp, sizeof(tmp));
-
-            Errno(0).raise(StringBuilder()
-                           << StringView(u8"no iface owns ")
-                           << StringView(tmp));
-        }
-
-        return StringView(buf);
+        Errno(0).raise(StringBuilder()
+                       << StringView(u8"no iface owns ")
+                       << StringView(tmp));
     }
 
     void setBufForce(int fd, int opt, int sz, StringView name) {
@@ -81,8 +81,7 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int snd
 
     auto* sin = (const sockaddr_in*)src;
 
-    Buffer ifname;
-    StringView name = ifaceFor(sin->sin_addr.s_addr, ifname);
+    StringView name = ifaceFor(pool, sin->sin_addr.s_addr);
 
     if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, name.data(), name.length()) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"SO_BINDTODEVICE ") << name);

@@ -20,11 +20,10 @@
 using namespace stl;
 
 namespace {
-    // Find the iface whose primary IPv4 matches `addr_ne` (network
-    // byte order). Used for SO_BINDTODEVICE — gofra TX must leave on
-    // the NIC that owns the source IP, regardless of the routing
-    // table's own pick. Writes the iface name into `out` (NUL-
-    // terminated, length <= IFNAMSIZ-1) and returns the length.
+    // Iface whose primary IPv4 matches `addr_ne` (NBO). For
+    // SO_BINDTODEVICE: TX must leave on the NIC owning the src IP,
+    // not whatever the routing table picks. Writes NUL-terminated
+    // name into `out`, returns its length.
     size_t ifaceFor(u32 addr_ne, char out[IFNAMSIZ]) {
         ifaddrs* ifs = nullptr;
 
@@ -80,17 +79,14 @@ namespace {
 }
 
 int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int sndBuf) {
-    // Blocking socket — udpReader pthreads block on recvmmsg with
-    // MSG_WAITFORONE; non-blocking would just spin EAGAIN.
+    // Blocking — udpReader sleeps in recvmmsg(MSG_WAITFORONE).
     int fd = ::socket(src->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"socket(UDP)"));
     }
 
-    // Hand fd ownership to the pool — pool death triggers ::close.
-    // From here on any throw still leaves a live fd that the pool's
-    // destructor chain will reap when the surrounding scope unwinds.
+    // Pool owns the fd; throws below unwind through ScopedFD.
     pool->make<ScopedFD>(fd);
 
     auto* sin = (const sockaddr_in*)src;

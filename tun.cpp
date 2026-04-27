@@ -25,9 +25,7 @@
 using namespace stl;
 
 namespace {
-    // Stack buffer for one netlink request. 8 KiB covers any rtnetlink
-    // message we issue (RTM_NEWLINK / RTM_NEWADDR with a handful of
-    // attrs); the alignas keeps `nlmsghdr` happy.
+    // Stack buffer for one rtnetlink request; covers any of ours.
     constexpr size_t NL_BUF = 8192;
 
     void copyIfName(char dst[IFNAMSIZ], StringView name) {
@@ -40,17 +38,15 @@ namespace {
         dst[name.length()] = 0;
     }
 
-    // Look up the kernel iface index by name. SIOCGIFINDEX is a getter,
-    // not a setter — it doesn't suffer from the SIOCSIF* P2P-route bug
-    // we worked around by going to netlink for SET ops.
+    // SIOCGIFINDEX is a pure getter; safe (unlike the SIOCSIF*
+    // setters that drop egress on a /24 P2P TUN).
     int ifIndexFor(const char* dev) {
         int rawS = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (rawS < 0) {
             Errno().raise(StringBuilder() << StringView(u8"socket(AF_INET,SOCK_DGRAM)"));
         }
 
-        // Function-scoped fd: stack RAII via stl::ScopedFD closes it on
-        // any return / throw without bothering the caller's pool.
+        // Stack RAII; closes on any return / throw.
         ScopedFD s(rawS);
 
         ifreq ifr = {};
@@ -65,10 +61,9 @@ namespace {
         return ifr.ifr_ifindex;
     }
 
-    // Thin RAII wrapper around an mnl_socket bound to NETLINK_ROUTE.
-    // Each setMtu/addAddr/linkUp builds one rtnetlink message and runs
-    // it via run(); run() throws on send / recv / ACK error tagged
-    // with `what`.
+    // RAII over an mnl_socket on NETLINK_ROUTE. setMtu/addAddr/
+    // linkUp each build one message and run() it; run() throws
+    // tagged `what` on any error.
     struct Netlink {
         mnl_socket* nl;
         u32 portId;
@@ -95,11 +90,8 @@ namespace {
 
 }
 
-// Iface-level config via rtnetlink. Mirrors what gofra1's
-// vishvananda/netlink does — proper NEWADDR with all the right
-// attrs (IFA_LOCAL, IFA_ADDRESS, IFA_BROADCAST, prefixlen, scope).
-// The legacy SIOCSIF* ioctl path silently drops egress on a /24
-// P2P TUN even though the route table looks right.
+// Iface mtu/addr/up via rtnetlink — the SIOCSIF* path silently
+// drops egress on a /24 P2P TUN.
 void gofra::configureTun(const char* dev, int mtu, u32 vip, u8 prefixLen) {
     int idx = ifIndexFor(dev);
 
@@ -181,12 +173,11 @@ void Netlink::addAddr(int idx, u32 vip, u8 prefixLen) {
     ifa->ifa_scope = RT_SCOPE_UNIVERSE;
     ifa->ifa_index = (u32)idx;
 
-    // host-order vip → network-order on the wire.
     u32 vipNet = htonl(vip);
     mnl_attr_put_u32(nh, IFA_LOCAL, vipNet);
     mnl_attr_put_u32(nh, IFA_ADDRESS, vipNet);
 
-    // Broadcast = vip | host-mask. Skip for /32 (no broadcast).
+    // Broadcast = vip | host-mask. /32 has none.
     if (prefixLen < 32) {
         u32 hostMask = (prefixLen == 0)
             ? 0xFFFFFFFFu
@@ -221,8 +212,7 @@ int gofra::openTun(ObjPool* pool, const char* dev) {
         Errno().raise(StringBuilder() << StringView(u8"open /dev/net/tun"));
     }
 
-    // Hand fd ownership to the pool — any throw below leaves a live
-    // fd that the pool's destructor chain will reap on unwind.
+    // Pool owns the fd; throws below unwind through ScopedFD.
     pool->make<ScopedFD>(fd);
 
     ifreq ifr = {};
@@ -233,19 +223,15 @@ int gofra::openTun(ObjPool* pool, const char* dev) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETIFF ") << StringView(dev));
     }
 
-    // Pin virtio_net_hdr to the legacy 10-byte layout (newer kernels
-    // can advertise the 12-byte virtio_net_hdr_v1; gso.cpp's struct
-    // assumes 10).
+    // Pin to the 10-byte virtio_net_hdr; gso.cpp assumes that.
     int hdrSize = 10;
 
     if (ioctl(fd, TUNSETVNETHDRSZ, &hdrSize) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETVNETHDRSZ ") << StringView(dev));
     }
 
-    // Negotiate CSUM + TSO4 offload. Without this, IFF_VNET_HDR
-    // mode reads still work but gso_type is always GSO_NONE — we
-    // pay the per-packet syscall overhead, and the multi-NIC stripe
-    // shreds TCP order. This is the whole point of phase 2.
+    // CSUM + TSO4: without it gso_type is always NONE and we eat
+    // a syscall per MTU-sized segment.
     unsigned long off = TUN_F_CSUM | TUN_F_TSO4;
 
     if (ioctl(fd, TUNSETOFFLOAD, off) < 0) {

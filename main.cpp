@@ -1,13 +1,6 @@
-// gofra2 — C++ data plane on top of std/.
-//
-// Plain pthreads, blocking syscalls, no coroutines. Each TUN queue
-// gets a dedicated tunReader thread (read → gsoSplit → per-segment
-// sendto via stripe); each UDP socket gets a dedicated udpReader
-// thread (recvmmsg(64) → write each to the paired TUN queue). N is
-// the local underlay count (== self->dstCount()). This matches Go
-// gofra1's runtime shape and lets us amortize RX syscalls via
-// recvmmsg, which is the main reason gofra1 reaches 3 Gbps where
-// our coroutine + io_uring per-packet variant capped at 1 Gbps.
+// gofra2 — C++ data plane on top of std/. Plain pthreads, blocking
+// syscalls. N TUN queues paired with N UDP sockets by index; one
+// tunReader + one udpReader thread per index. N = self->dstCount().
 
 #include "config.h"
 #include "conn.h"
@@ -58,13 +51,11 @@ namespace {
         auto pool = ObjPool::fromMemory();
         auto cfg = loadConfig(pool.mutPtr(), configPath);
 
-        // ConnTable opens N=self->dstCount() UDP sockets internally
-        // and pre-builds the N*M stripe slots per remote peer.
+        // ConnTable opens N UDP sockets and pre-builds N*M stripe slots.
         auto* conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self,
                                         cfg->udpRecvBuf, cfg->udpSendBuf);
 
-        // Open N TUN queues paired with the N UDP sockets by index.
-        // Iface-level mtu/addr/up runs once after all queues attach.
+        // Iface mtu/addr/up runs once, after all N queues attach.
         size_t n = conns->srcCount();
         Vector<int> tunFds;
 
@@ -80,10 +71,9 @@ namespace {
              << StringView(u8" peers=") << (u64)conns->size()
              << endL;
 
-        // 2*N OS threads, paired by index. Scratch buffers are
-        // pool-allocated up-front (single-threaded — pool isn't
-        // thread-safe), runables go on the heap with self-delete via
-        // makeRunablePtr so they survive the spawn call.
+        // 2*N threads paired by index. Scratch is pool-allocated
+        // up-front (pool isn't thread-safe); runables self-delete
+        // via makeRunablePtr so they outlive spawn.
         Vector<Thread*> threads;
         for (size_t i = 0; i < n; ++i) {
             int tunFd = tunFds[i];
@@ -104,8 +94,7 @@ namespace {
             threads.pushBack(Thread::create(pool.mutPtr(), *ur));
         }
 
-        // Park forever — threads loop until process death; SIGINT/
-        // SIGTERM kills us and pid1 reaps the worker threads.
+        // Park forever; pid1 reaps workers on SIGTERM.
         for (size_t i = 0; i < threads.length(); ++i) {
             threads[i]->join();
         }

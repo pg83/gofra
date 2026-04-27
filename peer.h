@@ -13,18 +13,15 @@ namespace gofra {
         struct Section;
     }
 
-    // Peer: one VIP → its underlay endpoints. dst(i)/dstCount() expose
-    // the endpoints; the hot-path stripe lives in conn.h, not here.
+    // One VIP → its underlay endpoints. The hot-path stripe is in conn.h.
     struct Peer {
         virtual u32 vip() const noexcept = 0;
         virtual size_t dstCount() const noexcept = 0;
         virtual const sockaddr* dst(size_t i) const noexcept = 0;
     };
 
-    // PeerTable: pure cluster map, every overlay-VIP → Peer in the
-    // cluster (us included). It has no notion of "self" — Config
-    // resolves that via lookup(my_vip). Each entry's values are full
-    // ip:port pairs parsed at config time, no global listen_port.
+    // Cluster map: every overlay VIP → Peer (us included). No "self";
+    // Config resolves that via lookup(my_vip).
     struct PeerTable {
         virtual size_t size() const noexcept = 0;
         virtual Peer* at(size_t i) const noexcept = 0;
@@ -33,8 +30,6 @@ namespace gofra {
         static PeerTable* create(stl::ObjPool* pool, ini::Section* sec);
     };
 
-    // Pull the IPv4 dst out of an inner packet. Returns false (and
-    // leaves *out untouched) if the buffer is too short or the first
-    // nibble isn't 4 (we drop IPv6 for now).
+    // Read IPv4 dst from the packet. False (no write) if too short or v6.
     bool dstFromIPv4(const u8* pkt, size_t len, u32* out) noexcept;
 }

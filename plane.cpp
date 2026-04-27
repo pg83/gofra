@@ -20,18 +20,9 @@
 using namespace stl;
 using namespace gofra;
 
-// Per-tunReader scratch.
-//
-// Wireguard-go's tunReader sizes: one super-packet up to 64 KiB
-// inner + 10 B virtio_net_hdr + slack, plus up to 64 segment
-// buffers (MTU + slack) and a parallel pointer table so gsoSplit
-// can address them as `u8* const*`.
-//
-// On TX we use UDP_SEGMENT (USO): the N segments are scatter-
-// gathered as iovecs in one sendmsg, the kernel/NIC re-segments
-// the concatenated payload into N UDP datagrams of gso_size each.
-// One syscall per super-packet, all segments through one (src,dst)
-// pair so within-flow ordering is preserved.
+// Per-tunReader scratch: 64 KiB super-packet read buf + up to 64
+// MTU-sized segment buffers + parallel pointer/size tables for
+// gsoSplit, plus iovecs for scatter-gather sendmsg(USO).
 struct gofra::TunReaderScratch {
     static constexpr size_t MAX_SEGS  = 64;
     static constexpr size_t SEG_SIZE  = 2048;            // MTU + slack
@@ -50,14 +41,10 @@ struct gofra::TunReaderScratch {
     }
 };
 
-// Per-udpReader scratch.
-//
-// 64-deep recvmmsg batch. Each slot's iov_base points 10 bytes
-// into its buffer so the virtio_net_hdr prefix stays zero — when
-// we hand the packet to the TUN it's read as gso_type=NONE / no
-// flags. addr/iov/msghdr indices match buffer index. addrs[i]
-// points at a pool-allocated sockaddr_storage so the scratch
-// itself stays AF-agnostic.
+// Per-udpReader scratch: 64-deep recvmmsg batch. iov_base points
+// buf+10 so the virtio_net_hdr prefix stays zero across calls and
+// we hand the TUN [10 B zero hdr | payload]. addrs hold pool-
+// allocated sockaddr_storage so the scratch is AF-agnostic.
 struct gofra::UdpReaderScratch {
     static constexpr size_t BATCH    = 64;
     static constexpr size_t MSG_SIZE = 10 + 9000;        // virtio + jumbo
@@ -71,9 +58,8 @@ struct gofra::UdpReaderScratch {
         for (size_t i = 0; i < BATCH; ++i) {
             addrs[i] = (sockaddr*)pool->make<sockaddr_storage>();
 
-            // Pre-zero the virtio_net_hdr prefix. recvmmsg writes
-            // into iov_base which is buf + 10; the prefix stays
-            // untouched and zero across iterations.
+            // Pre-zero the virtio_net_hdr prefix; recvmmsg writes
+            // into buf+10 only.
             zeroVirtioNetHdr(bufs[i]);
 
             iovs[i].iov_base = bufs[i] + VIRTIO_NET_HDR_LEN;
@@ -103,7 +89,7 @@ namespace {
         sysE << StringView(u8"gofra2: ") << msg << endL;
     }
 
-    // Send one fully-formed inner IP packet via the next stripe slot.
+    // Send one inner IP packet via the next stripe slot.
     void sendOne(Conn* conn, const u8* pkt, size_t len) {
         auto slot = conn->next();
 
@@ -115,17 +101,10 @@ namespace {
         }
     }
 
-    // Send the N gsoSplit segments as USO_PARTS sendmsg+UDP_SEGMENT
-    // calls, each part through its own stripe slot. This restores
-    // RX parallelism: a single super-packet's segments land on
-    // multiple (src,dst) pairs — and so on multiple peer udpReader
-    // threads — instead of one. Each part is small enough to stay
-    // well under the kernel's IP_MAX_MTU cork cap (~65515 B), so no
-    // further byte-chunking inside a part.
-    //
-    // Each part's segments are equal-sized except possibly the very
-    // last one of the LAST part (gsoSplit's invariant), which is
-    // exactly what UDP_SEGMENT expects.
+    // Send N gsoSplit segments as USO_PARTS sendmsg(UDP_SEGMENT)
+    // calls, each part on its own stripe slot — restores RX-side
+    // parallelism (segments hit multiple peer udpReader threads).
+    // Parts stay well under the kernel's ~65515 B cork cap.
     constexpr int USO_PARTS = 8;
 
     void sendUso(Conn* conn, TunReaderScratch* sc, int segs) {
@@ -233,17 +212,14 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
             continue;
         }
 
-        // Unsupported gso_type (UDP / TCPV6). With our TUNSETOFFLOAD
-        // mask of CSUM|TSO4, the kernel shouldn't produce these.
+        // TUNSETOFFLOAD is CSUM|TSO4, so UDP/TCPV6 shouldn't arrive.
         warn(StringView(u8"tunReader: unsupported gso_type"));
     }
 }
 
 void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
     for (;;) {
-        // recvmmsg drains up to BATCH packets in one syscall;
-        // MSG_WAITFORONE blocks until at least one is available,
-        // then reaps everything else already queued.
+        // MSG_WAITFORONE blocks for the first, drains the rest.
         int n = ::recvmmsg(udpFd, sc->msgs, UdpReaderScratch::BATCH, MSG_WAITFORONE, nullptr);
 
         if (n < 0) {
@@ -258,12 +234,10 @@ void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
                 continue;
             }
 
-            // Reset namelen for the next round; recvmmsg shrinks it
-            // to the actual sender addr len (16 for IPv4) but we
-            // also rely on the iov_len being preserved across calls.
+            // recvmmsg shrunk namelen to the actual sender; reset.
             sc->msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
 
-            // [10 B virtio_net_hdr (zeroed once at scratch ctor) | payload].
+            // [10 B zero virtio_net_hdr | payload] → TUN.
             ssize_t w = ::write(tunFd, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen);
 
             if (w < 0) {

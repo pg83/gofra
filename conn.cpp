@@ -65,17 +65,14 @@ ConnTableImpl::ConnTableImpl(ObjPool* pool, PeerTable* peers, Peer* self, int rc
 {
     size_t n = self->dstCount();
 
-    // Open N source sockets, one per local underlay. fds get pool-
-    // tracked (ScopedFD) inside openUdpSocket, so we just stash the
-    // ints.
+    // N src sockets, one per local underlay; fds are pool-tracked
+    // inside openUdpSocket.
     for (size_t i = 0; i < n; ++i) {
         srcFds_.pushBack(openUdpSocket(pool, self->dst(i), rcvBuf, sndBuf));
     }
 
-    // For each peer other than self, lay out N*M slots in the order
-    // [j*N + i] so the atomic counter rotates src fast and dst slow:
-    //   k=0 → (s0,d0), k=1 → (s1,d0), ..., k=N → (s0,d1), ...
-    // matches gofra1's stripe (srcIdx = c%N, dstIdx = (c/N)%M).
+    // Slots laid [j*N + i] so the rr counter rotates src fast and
+    // dst slow: srcIdx=c%N, dstIdx=(c/N)%M (matches gofra1).
     for (size_t k = 0; k < peers->size(); ++k) {
         Peer* p = peers->at(k);
 

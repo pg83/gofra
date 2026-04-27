@@ -9,12 +9,9 @@ namespace stl {
 }
 
 namespace gofra::ini {
-    // One INI section. `map` answers `find(key)` in O(1); `keys`
-    // preserves insertion order and the original key strings (the
-    // SymbolMap stores only their hashes), so callers that need to
-    // walk every key in a dynamic section — e.g. [peer] where the
-    // keys are peer VIPs — can iterate `keys` and look the values up
-    // in `map`.
+    // One INI section. `map` answers find(key) in O(1); `keys`
+    // keeps insertion order + the original key strings (SymbolMap
+    // hashes only), so dynamic sections like [peers] can iterate.
     struct Section {
         stl::SymbolMap<stl::StringView> map;
         stl::Vector<stl::StringView> keys;
@@ -27,9 +24,7 @@ namespace gofra::ini {
 
     using Config = stl::SymbolMap<Section>;
 
-    // Parse INI text. Section / key / value StringViews reference into
-    // `src` — keep src alive while using the result. Lines outside any
-    // [section] go into a section keyed by the empty StringView. The
-    // returned Config lives in `pool` (pool->make).
+    // Parse INI. Returned views reference into `src` (keep alive).
+    // Pre-section lines go to a section keyed by the empty view.
     Config* parseConfig(stl::ObjPool* pool, stl::StringView src);
 }

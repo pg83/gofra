@@ -50,8 +50,7 @@ void gofra::zeroVirtioNetHdr(u8* data) noexcept {
 void gofra::gsoNoneChecksum(u8* pkt, size_t pktLen, u16 csumStart, u16 csumOffset) noexcept {
     size_t at = (size_t)csumStart + (size_t)csumOffset;
 
-    // Kernel parks the pseudo-header sum at csumOffset; pull it out,
-    // zero the field, fold the full L4 checksum on top.
+    // Kernel parked the pseudo-hdr sum at csumOffset; fold L4 onto it.
     u64 initial = (u64)getBE16(pkt + at);
 
     pkt[at] = 0;
@@ -64,8 +63,7 @@ void gofra::gsoNoneChecksum(u8* pkt, size_t pktLen, u16 csumStart, u16 csumOffse
 
 int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
                     u8* const* outBufs, size_t* outSizes, size_t maxSegs) noexcept {
-    // We only ever negotiate TCPV4 with the kernel; reject anything
-    // else conservatively so the caller can decide what to do.
+    // We negotiate TCPV4 only; caller decides on anything else.
     if (hdr.gsoType != VIRTIO_NET_HDR_GSO_TCPV4) {
         return -1;
     }
@@ -76,9 +74,7 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
     const size_t addrLen = IPV4_ADDR_LEN;
     const u8 protocol = IPPROTO_TCP_V;
 
-    // Zero the IPv4 header checksum and the L4 checksum field in the
-    // master `in` buffer so subsequent per-segment recomputations
-    // start from a clean slate.
+    // Zero IPv4 + L4 csum fields in `in` for clean recompute below.
     in[10] = 0;
     in[11] = 0;
 
@@ -110,11 +106,10 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
 
         u8* out = outBufs[i];
 
-        // -- IP header (csumStart bytes) --
+        // -- IP header --
         memCpy(out, in, iphLen);
 
-        // Per-segment IPv4 ID is base + i; total length differs;
-        // header checksum recomputed from scratch.
+        // IPv4 ID += i; tot_len differs; csum recomputed.
         if (i > 0) {
             u16 id = getBE16(out + 4);
             id = (u16)(id + (u16)i);
@@ -126,7 +121,7 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
         u16 ipv4Csum = (u16)~checksum(out, iphLen, 0);
         putBE16(out + 10, ipv4Csum);
 
-        // -- transport header (TCP, hdrLen - csumStart bytes) --
+        // -- TCP header --
         const size_t transportHdrLen = hdrTotal - iphLen;
         memCpy(out + iphLen, in + iphLen, transportHdrLen);
 
@@ -134,14 +129,14 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
         putBE32(out + iphLen + 4, tcpSeq);
 
         if (nextEnd != inLen) {
-            // FIN / PSH only on the final segment.
+            // FIN/PSH only on the last segment.
             out[iphLen + TCP_FLAGS_OFFSET] &= (u8)~(TCP_FLAG_FIN | TCP_FLAG_PSH);
         }
 
         // -- payload --
         memCpy(out + hdrTotal, in + nextDataAt, segDataLen);
 
-        // -- transport checksum --
+        // -- TCP csum --
         const u16 lenForPseudo = (u16)(transportHdrLen + segDataLen);
         const u64 pseudo = pseudoHeaderChecksumNoFold(
             protocol,

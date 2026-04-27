@@ -47,7 +47,7 @@ StringView IniError::description() {
 Config* gofra::ini::parseConfig(ObjPool* pool, StringView src) {
     auto cfg = pool->make<Config>(pool);
 
-    // Implicit "" section catches lines before the first [...].
+    // Implicit "" section for lines before the first [...].
     Section* sec = cfg->insert(StringView(), pool);
 
     while (!src.empty()) {
@@ -92,8 +92,8 @@ Config* gofra::ini::parseConfig(ObjPool* pool, StringView src) {
         key = key.stripSpace();
         val = val.stripSpace();
 
-        // Track first-seen key in `keys` (re-declarations replace the
-        // value but don't duplicate the key in the iteration list).
+        // First-seen key tracked in `keys`; re-declares replace the
+        // value without duplicating the iteration entry.
         if (!sec->map.find(key)) {
             sec->keys.pushBack(key);
         }

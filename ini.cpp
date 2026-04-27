@@ -23,23 +23,25 @@ namespace {
             return ExceptionKind::Verify;
         }
 
-        StringView description() override {
-            if (!full_.empty()) {
-                return full_;
-            }
-
-            (StringBuilder()
-             << StringView(u8"ini: ")
-             << msg_)
-                .xchg(full_);
-
-            return full_;
-        }
+        StringView description() override;
     };
 
     [[noreturn]] void raise(Buffer&& msg) {
         throw IniError(move(msg));
     }
+}
+
+StringView IniError::description() {
+    if (!full_.empty()) {
+        return full_;
+    }
+
+    (StringBuilder()
+     << StringView(u8"ini: ")
+     << msg_)
+        .xchg(full_);
+
+    return full_;
 }
 
 Config* gofra::ini::parseConfig(ObjPool* pool, StringView src) {

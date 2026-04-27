@@ -33,18 +33,7 @@ namespace {
             return ExceptionKind::Verify;
         }
 
-        StringView description() override {
-            if (!full_.empty()) {
-                return full_;
-            }
-
-            (StringBuilder()
-             << StringView(u8"config: ")
-             << msg_)
-                .xchg(full_);
-
-            return full_;
-        }
+        StringView description() override;
     };
 
     [[noreturn]] void raise(Buffer&& msg) {
@@ -175,6 +164,19 @@ namespace {
             cfg->udpSendBuf = (int)v->stou();
         }
     }
+}
+
+StringView ConfigError::description() {
+    if (!full_.empty()) {
+        return full_;
+    }
+
+    (StringBuilder()
+     << StringView(u8"config: ")
+     << msg_)
+        .xchg(full_);
+
+    return full_;
 }
 
 Config* gofra::loadConfig(ObjPool* pool, StringView path) {

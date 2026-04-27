@@ -71,19 +71,7 @@ namespace {
         u32 portId;
         u32 seq;
 
-        Netlink() {
-            nl = mnl_socket_open(NETLINK_ROUTE);
-            if (!nl) {
-                Errno().raise(StringBuilder() << StringView(u8"mnl_socket_open"));
-            }
-            if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-                int e = errno;
-                mnl_socket_close(nl);
-                Errno(e).raise(StringBuilder() << StringView(u8"mnl_socket_bind"));
-            }
-            portId = mnl_socket_get_portid(nl);
-            seq = 0;
-        }
+        Netlink();
 
         ~Netlink() noexcept {
             mnl_socket_close(nl);
@@ -96,25 +84,7 @@ namespace {
             return ++seq;
         }
 
-        void run(nlmsghdr* nh, StringView what) {
-            if (mnl_socket_sendto(nl, nh, nh->nlmsg_len) < 0) {
-                Errno().raise(StringBuilder() << what
-                              << StringView(u8": mnl_socket_sendto"));
-            }
-
-            alignas(u32) char rbuf[NL_BUF];
-            ssize_t n = mnl_socket_recvfrom(nl, rbuf, sizeof(rbuf));
-            if (n < 0) {
-                Errno().raise(StringBuilder() << what
-                              << StringView(u8": mnl_socket_recvfrom"));
-            }
-
-            int rc = mnl_cb_run(rbuf, (size_t)n, nh->nlmsg_seq, portId, nullptr, nullptr);
-            if (rc < 0) {
-                Errno().raise(StringBuilder() << what
-                              << StringView(u8": netlink ack"));
-            }
-        }
+        void run(nlmsghdr* nh, StringView what);
     };
 
     void setMtu(Netlink& nl, int idx, int mtu) {
@@ -194,6 +164,42 @@ namespace {
         setMtu(nl, idx, mtu);
         addAddr(nl, idx, vip, prefixLen);
         linkUp(nl, idx);
+    }
+}
+
+Netlink::Netlink() {
+    nl = mnl_socket_open(NETLINK_ROUTE);
+    if (!nl) {
+        Errno().raise(StringBuilder() << StringView(u8"mnl_socket_open"));
+    }
+
+    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
+        int e = errno;
+        mnl_socket_close(nl);
+        Errno(e).raise(StringBuilder() << StringView(u8"mnl_socket_bind"));
+    }
+
+    portId = mnl_socket_get_portid(nl);
+    seq = 0;
+}
+
+void Netlink::run(nlmsghdr* nh, StringView what) {
+    if (mnl_socket_sendto(nl, nh, nh->nlmsg_len) < 0) {
+        Errno().raise(StringBuilder() << what
+                      << StringView(u8": mnl_socket_sendto"));
+    }
+
+    alignas(u32) char rbuf[NL_BUF];
+    ssize_t n = mnl_socket_recvfrom(nl, rbuf, sizeof(rbuf));
+    if (n < 0) {
+        Errno().raise(StringBuilder() << what
+                      << StringView(u8": mnl_socket_recvfrom"));
+    }
+
+    int rc = mnl_cb_run(rbuf, (size_t)n, nh->nlmsg_seq, portId, nullptr, nullptr);
+    if (rc < 0) {
+        Errno().raise(StringBuilder() << what
+                      << StringView(u8": netlink ack"));
     }
 }
 

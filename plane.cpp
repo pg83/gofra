@@ -24,19 +24,43 @@ using namespace gofra;
 // inner + 10 B virtio_net_hdr + slack, plus up to 64 segment
 // buffers (MTU + slack) and a parallel pointer table so gsoSplit
 // can address them as `u8* const*`.
+//
+// On TX we batch via sendmmsg(2): one bucket per local source
+// socket, segments routed by stripe slot srcIdx. Each non-empty
+// bucket is drained with one syscall regardless of how many
+// segments landed in it (worst case N≈4 syscalls per super-packet
+// instead of up to MAX_SEGS sendto's).
 struct gofra::TunReaderScratch {
     static constexpr size_t MAX_SEGS  = 64;
     static constexpr size_t SEG_SIZE  = 2048;            // MTU + slack
     static constexpr size_t READ_SIZE = 10 + 65535 + 128;
+
+    struct TxBucket {
+        int srcFd;
+        size_t count;
+        mmsghdr msgs[MAX_SEGS];
+        iovec iovs[MAX_SEGS];
+    };
 
     u8 readBuf[READ_SIZE];
     u8 segBufs[MAX_SEGS][SEG_SIZE];
     u8* segPtrs[MAX_SEGS];
     size_t segSizes[MAX_SEGS];
 
-    TunReaderScratch() noexcept {
+    size_t numBuckets;
+    TxBucket* buckets;
+
+    TunReaderScratch(ObjPool* pool, ConnTable* conns) noexcept {
         for (size_t i = 0; i < MAX_SEGS; ++i) {
             segPtrs[i] = segBufs[i];
+        }
+
+        numBuckets = conns->srcCount();
+        buckets = (TxBucket*)pool->allocate(numBuckets * sizeof(TxBucket));
+
+        for (size_t i = 0; i < numBuckets; ++i) {
+            buckets[i].srcFd = conns->srcFd(i);
+            buckets[i].count = 0;
         }
     }
 };
@@ -105,10 +129,54 @@ namespace {
             warnErrno(StringView(u8"udp sendto"), errno);
         }
     }
+
+    // Send `segs` segments by bucketing them per srcFd via the stripe
+    // counter, then issuing one sendmmsg per non-empty bucket. The
+    // dst per segment is taken from the slot, so different (src,dst)
+    // pairs land in different buckets *and* different mmsghdrs within
+    // the bucket — each msghdr carries its own msg_name.
+    void sendBatch(Conn* conn, TunReaderScratch* sc, int segs) {
+        for (size_t b = 0; b < sc->numBuckets; ++b) {
+            sc->buckets[b].count = 0;
+        }
+
+        for (int i = 0; i < segs; ++i) {
+            auto* slot = conn->next();
+            auto* bk = &sc->buckets[slot->srcIdx];
+            size_t k = bk->count++;
+
+            bk->iovs[k].iov_base = sc->segBufs[i];
+            bk->iovs[k].iov_len  = sc->segSizes[i];
+
+            auto& mh = bk->msgs[k].msg_hdr;
+            mh.msg_name       = (void*)slot->dstAddr;
+            mh.msg_namelen    = addrLen(slot->dstAddr);
+            mh.msg_iov        = &bk->iovs[k];
+            mh.msg_iovlen     = 1;
+            mh.msg_control    = nullptr;
+            mh.msg_controllen = 0;
+            mh.msg_flags      = 0;
+            bk->msgs[k].msg_len = 0;
+        }
+
+        for (size_t b = 0; b < sc->numBuckets; ++b) {
+            auto* bk = &sc->buckets[b];
+
+            if (!bk->count) {
+                continue;
+            }
+
+            int sent = ::sendmmsg(bk->srcFd, bk->msgs, (unsigned)bk->count, 0);
+
+            if (sent < 0) {
+                warnErrno(StringView(u8"udp sendmmsg"), errno);
+            }
+        }
+    }
 }
 
-TunReaderScratch* gofra::makeTunReaderScratch(ObjPool* pool) {
-    return pool->make<TunReaderScratch>();
+TunReaderScratch* gofra::makeTunReaderScratch(ObjPool* pool, ConnTable* conns) {
+    return pool->make<TunReaderScratch>(pool, conns);
 }
 
 UdpReaderScratch* gofra::makeUdpReaderScratch(ObjPool* pool) {
@@ -161,9 +229,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
                 continue;
             }
 
-            for (int i = 0; i < segs; ++i) {
-                sendOne(conn, sc->segBufs[i], sc->segSizes[i]);
-            }
+            sendBatch(conn, sc, segs);
             continue;
         }
 

@@ -15,7 +15,7 @@ using namespace gofra;
 namespace {
     struct ConnImpl: public Conn {
         u32 vip_;
-        Vector<ConnSlot> slots_;
+        Vector<const ConnSlot*> slots_;
         u64 rr_ = 0;
 
         explicit ConnImpl(u32 vip) noexcept
@@ -57,7 +57,7 @@ const ConnSlot* ConnImpl::next() noexcept {
     u64 c = stdAtomicAddAndFetch(&rr_, (u64)1, MemoryOrder::Relaxed) - 1;
     size_t i = (size_t)(c % slots_.length());
 
-    return &slots_[i];
+    return slots_[i];
 }
 
 ConnTableImpl::ConnTableImpl(ObjPool* pool, PeerTable* peers, Peer* self, int rcvBuf, int sndBuf)
@@ -88,11 +88,12 @@ ConnTableImpl::ConnTableImpl(ObjPool* pool, PeerTable* peers, Peer* self, int rc
 
         for (size_t j = 0; j < m; ++j) {
             for (size_t i = 0; i < n; ++i) {
-                ConnSlot s = {
+                auto* s = pool->make<ConnSlot>(ConnSlot{
                     self->dst(i),
                     srcFds_[i],
+                    (u32)i,
                     p->dst(j),
-                };
+                });
 
                 conn->slots_.pushBack(s);
             }

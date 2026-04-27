@@ -89,7 +89,7 @@ namespace {
             int tunFd = tunFds[i];
             int srcFd = conns->srcFd(i);
 
-            auto* ts = makeTunReaderScratch(pool.mutPtr());
+            auto* ts = makeTunReaderScratch(pool.mutPtr(), conns);
             auto* us = makeUdpReaderScratch(pool.mutPtr());
 
             auto* tr = makeRunablePtr([tunFd, conns, ts] {

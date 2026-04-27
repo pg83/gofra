@@ -1,5 +1,17 @@
 # Notes for working in this repo
 
+## Coding conventions
+
+- Git author: `claude <claude@users.noreply.github.com>`. Commit messages in English.
+- Types: `CamelCase`. Variables/functions: `camelCase`. Private members: trailing `_` (e.g. `len_`, `ptr_`). Macros: `STD_*` prefix.
+- CamelCase for test names in `STD_TEST`.
+- Namespace `stl` for public API. Free classes and functions in `.cpp` go into anonymous namespace.
+- Methods longer than 1 line must be defined out of line and outside any namespace.
+- Each `xxx.h` must have a corresponding `xxx.cpp`.
+- No single-line braced blocks: `{ ... }` must span multiple lines.
+- Avoid includes in headers; prefer forward declarations. Only include in `.cpp` files.
+- Type aliases: `i8`/`u8`/`i16`/`u16`/`i32`/`u32`/`i64`/`u64` from `std/sys/types.h`.
+
 ## Mental model
 
 Single-file daemon. `main.go` parses flags, loads JSON config, builds a

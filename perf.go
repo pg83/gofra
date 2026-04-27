@@ -68,7 +68,6 @@ func runPerf(args []string) {
 	fs := flag.NewFlagSet("perf", flag.ExitOnError)
 	writers := fs.Int("writers", 4, "number of TUN-queue writer goroutines")
 	timeoutUs := fs.Int("timeout-us", 1000, "reorder timeout in microseconds")
-	wTimeoutUs := fs.Int("writer-timeout-us", 1000, "writer timeout in microseconds")
 	payload := fs.Int("payload", 1400, "inner payload bytes per packet")
 	duration := fs.Duration("duration", 30*time.Second, "auto-stop after this; 0 = run until SIGINT")
 	_ = fs.Parse(args)
@@ -77,7 +76,6 @@ func runPerf(args []string) {
 
 	pipe := newReorderPipe(
 		time.Duration(*timeoutUs)*time.Microsecond,
-		time.Duration(*wTimeoutUs)*time.Microsecond,
 		ws,
 		silentLogger(),
 	)
@@ -113,6 +111,12 @@ func runPerf(args []string) {
 // channel will accept them. Pre-allocates a single shared payload
 // buffer (fakeTun doesn't read it; in real life every item gets a
 // fresh allocation because recvmmsg buffers are reused).
+//
+// synthBatchSize is how many items each synthetic batch carries.
+// Production batches are unbounded (only timeout-flushed); the
+// benchmark uses a fixed size so b.N maps cleanly to packet count.
+const synthBatchSize = 64
+
 func feeder(pipe *reorderPipe, payloadLen int, stop <-chan struct{}) {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	pay := make([]byte, virtioNetHdrLen+payloadLen)
@@ -127,7 +131,7 @@ func feeder(pipe *reorderPipe, payloadLen int, stop <-chan struct{}) {
 		default:
 		}
 
-		items := make([]rxItem, batchSize)
+		items := make([]rxItem, synthBatchSize)
 
 		for j := range items {
 			items[j] = rxItem{seq: seq, payload: pay}

@@ -24,37 +24,27 @@ type udpConfig struct {
 	SendBuf   int `json:"send_buf"`
 }
 
-type reorderConfig struct {
-	TimeoutUs int `json:"timeout_us"`
-}
-
-type writerConfig struct {
-	TimeoutUs int `json:"timeout_us"`
-}
-
 type Config struct {
 	LogLevel   string              `json:"log_level"`
 	ListenPort int                 `json:"listen_port"`
 	Me         meConfig            `json:"me"`
 	Peers      map[string][]string `json:"peers"`
 	Udp        udpConfig           `json:"udp"`
-	Reorder    reorderConfig       `json:"reorder"`
-	Writer     writerConfig        `json:"writer"`
+	TimeoutUs  int                 `json:"timeout_us"`
 }
 
 type parsedConfig struct {
-	LogLevel       string
-	ListenPort     uint16
-	Underlay       []netip.Addr
-	TunDev         string
-	TunMTU         int
-	TunVIP         netip.Prefix
-	PeerByVIP      map[netip.Addr][]netip.Addr
-	UdpRecvBatch   int
-	UdpRecvBuf     int
-	UdpSendBuf     int
-	ReorderTimeout time.Duration
-	WriterTimeout  time.Duration
+	LogLevel     string
+	ListenPort   uint16
+	Underlay     []netip.Addr
+	TunDev       string
+	TunMTU       int
+	TunVIP       netip.Prefix
+	PeerByVIP    map[netip.Addr][]netip.Addr
+	UdpRecvBatch int
+	UdpRecvBuf   int
+	UdpSendBuf   int
+	Timeout      time.Duration
 }
 
 func loadConfig(path string) *parsedConfig {
@@ -137,31 +127,25 @@ func loadConfig(path string) *parsedConfig {
 		udpSendBuf = 16 << 20
 	}
 
-	// timeout in microseconds. Sole flush trigger for reorder +
-	// writer loops; bigger = absorbs more inter-NIC jitter at
-	// the cost of in-tunnel latency.
-	reorderTimeoutUs := raw.Reorder.TimeoutUs
-	if reorderTimeoutUs <= 0 {
-		reorderTimeoutUs = 1000
-	}
-
-	writerTimeoutUs := raw.Writer.TimeoutUs
-	if writerTimeoutUs <= 0 {
-		writerTimeoutUs = 1000
+	// timeoutUs in microseconds — single hold knob for the whole
+	// pipeline. Bigger = absorbs more inter-NIC jitter at the
+	// cost of in-tunnel latency.
+	timeoutUs := raw.TimeoutUs
+	if timeoutUs <= 0 {
+		timeoutUs = 1000
 	}
 
 	return &parsedConfig{
-		LogLevel:       logLevel,
-		ListenPort:     uint16(raw.ListenPort),
-		Underlay:       underlay,
-		TunDev:         raw.Me.Tun.Dev,
-		TunMTU:         raw.Me.Tun.MTU,
-		TunVIP:         vip,
-		PeerByVIP:      peers,
-		UdpRecvBatch:   udpRecvBatch,
-		UdpRecvBuf:     udpRecvBuf,
-		UdpSendBuf:     udpSendBuf,
-		ReorderTimeout: time.Duration(reorderTimeoutUs) * time.Microsecond,
-		WriterTimeout:  time.Duration(writerTimeoutUs) * time.Microsecond,
+		LogLevel:     logLevel,
+		ListenPort:   uint16(raw.ListenPort),
+		Underlay:     underlay,
+		TunDev:       raw.Me.Tun.Dev,
+		TunMTU:       raw.Me.Tun.MTU,
+		TunVIP:       vip,
+		PeerByVIP:    peers,
+		UdpRecvBatch: udpRecvBatch,
+		UdpRecvBuf:   udpRecvBuf,
+		UdpSendBuf:   udpSendBuf,
+		Timeout:      time.Duration(timeoutUs) * time.Microsecond,
 	}
 }

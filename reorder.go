@@ -14,8 +14,8 @@ import (
 // Shape:
 //
 //   N udpReader goroutines  (one per src socket)
-//      │   batch up to batchSize packets, ship to peer's `in`
-//      ▼   (idle batches flushed by their owning udpReader)
+//      │   per recvmmsg, group items by peer, ship one batch per
+//      ▼   peer immediately (no userspace accumulator, no timer)
 //   1 reorder goroutine per peer
 //      │   accumulate batches for `timeout`, THEN bucket items by
 //      │   seq % numWriters into M sub-slices (no sort here —
@@ -23,7 +23,8 @@ import (
 //      │   channel send.
 //      ▼
 //   M writer goroutines, one per TUN queue
-//      │   sort own sub-slice, tun.Write each in seq order.
+//      │   receive ready sub-slice → sort by seq → tun.Write each
+//      │   in order. No accumulation: reorder is the sole hold.
 //
 // Why distribute-then-sort instead of sort-then-distribute:
 // parallelises the sort over M cores. Each writer sorts only its
@@ -46,19 +47,9 @@ type reorderPipe struct {
 	outs []chan []rxItem
 	stop chan struct{}
 
-	timeout       time.Duration
-	writerTimeout time.Duration
-	logger        *slog.Logger
+	timeout time.Duration
+	logger  *slog.Logger
 }
-
-const (
-	batchSize = 64
-	// batchFlushPeriod bounds how long a partly-filled batch sits
-	// in a udpReader before being shipped to the reorder
-	// goroutine. Short enough to not noticeably add to the
-	// user-visible reorder latency budget.
-	batchFlushPeriod = 1 * time.Millisecond
-)
 
 // rxItem carries one received packet from udpReader → reorder →
 // writer. payload is owned by the item (a caller-allocated copy);
@@ -71,19 +62,19 @@ type rxItem struct {
 	payload []byte
 }
 
-// batch groups up to batchSize rxItems for one channel send.
+// batch groups rxItems from one recvmmsg call for a single channel
+// send into the reorder goroutine.
 type batch struct {
 	items []rxItem
 }
 
-func newReorderPipe(timeout time.Duration, writerTimeout time.Duration, tuns []tunWriter, logger *slog.Logger) *reorderPipe {
+func newReorderPipe(timeout time.Duration, tuns []tunWriter, logger *slog.Logger) *reorderPipe {
 	p := &reorderPipe{
-		in:            make(chan *batch, 64),
-		outs:          make([]chan []rxItem, len(tuns)),
-		stop:          make(chan struct{}),
-		timeout:       timeout,
-		writerTimeout: writerTimeout,
-		logger:        logger,
+		in:      make(chan *batch, 64),
+		outs:    make([]chan []rxItem, len(tuns)),
+		stop:    make(chan struct{}),
+		timeout: timeout,
+		logger:  logger,
 	}
 
 	for i := range p.outs {
@@ -176,47 +167,20 @@ func (p *reorderPipe) reorderLoop() {
 	}
 }
 
-// writerLoop accumulates sub-slices from the reorder goroutine,
-// then every `writerTimeout` sorts the combined set by seq and
-// tun.Write's each item in order.
+// writerLoop drains sub-slices from the reorder goroutine. Each
+// sub-slice is already a ready chunk (one bucket from one reorder
+// flush) — sort by seq and tun.Write in order. No accumulation,
+// no timer here: reorder upstream is the sole hold point.
 func (p *reorderPipe) writerLoop(in <-chan []rxItem, tun tunWriter) {
-	pending := make([]rxItem, 0, 256)
-
-	timer := time.NewTimer(p.writerTimeout)
-	defer timer.Stop()
-
-	flush := func() {
-		if len(pending) == 0 {
-			return
-		}
-
-		sort.Slice(pending, func(i, j int) bool {
-			return pending[i].seq < pending[j].seq
+	for sub := range in {
+		sort.Slice(sub, func(i, j int) bool {
+			return sub[i].seq < sub[j].seq
 		})
 
-		for _, item := range pending {
+		for _, item := range sub {
 			if _, err := tun.Write(item.payload); err != nil {
 				p.logger.Warn("reorder writer: tun.Write failed", "err", err)
 			}
-		}
-
-		pending = pending[:0]
-	}
-
-	for {
-		select {
-		case sub, ok := <-in:
-			if !ok {
-				flush()
-
-				return
-			}
-
-			pending = append(pending, sub...)
-
-		case <-timer.C:
-			flush()
-			timer.Reset(p.writerTimeout)
 		}
 	}
 }

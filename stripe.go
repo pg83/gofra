@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -85,7 +84,7 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 
 		p := &peer{
 			dsts: dsts,
-			rx:   newReorderPipe(cfg.ReorderTimeout, cfg.WriterTimeout, writers, logger),
+			rx:   newReorderPipe(cfg.Timeout, writers, logger),
 		}
 		peers[vip] = p
 
@@ -96,8 +95,7 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 		logger.Info("peer registered",
 			"vip", vip,
 			"dsts", dsts,
-			"reorder_timeout", cfg.ReorderTimeout,
-			"writer_timeout", cfg.WriterTimeout,
+			"timeout", cfg.Timeout,
 		)
 	}
 
@@ -286,31 +284,20 @@ func (g *Gofra) makeSender(txWire []byte) func([]byte) {
 	}
 }
 
-// udpReader pumps inbound UDP packets through per-peer batches into
-// the reorder pipeline. recvmmsg drains the kernel; per-peer
-// pending batches are flushed when full (batchSize) or when the
-// flush-period ticker fires (so a quiet peer doesn't sit on a
-// half-filled batch indefinitely).
+// udpReader pumps inbound UDP packets through to the reorder
+// pipeline. recvmmsg drains the kernel — every syscall returns
+// 1+ packets in one go, which we group by peer and ship as one
+// batch per peer per recvmmsg call. No userspace accumulator,
+// no timer: the reorder goroutine downstream is the sole hold
+// point in the pipeline.
 func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 	return Try(func() {
 		rc := Throw2(s.SyscallConn())
 
 		msgs, buffers, names := prepareRawMessages(g.cfg.UdpRecvBatch)
 
-		// Per-peer pending batch. Keyed by *peer pointer.
-		pending := make(map[*peer]*batch)
-
-		flushTicker := time.NewTicker(batchFlushPeriod)
-		defer flushTicker.Stop()
-
-		flushAll := func() {
-			for p, b := range pending {
-				if b != nil && len(b.items) > 0 {
-					p.rx.in <- b
-					delete(pending, p)
-				}
-			}
-		}
+		// Per-recvmmsg grouping. Reused across iterations.
+		grouped := make(map[*peer][]rxItem)
 
 		var (
 			n    int
@@ -324,15 +311,6 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 		}
 
 		for {
-			// Non-blocking ticker check between recvmmsg calls
-			// to keep idle batches from sitting too long.
-			select {
-			case <-flushTicker.C:
-				flushAll()
-
-			default:
-			}
-
 			Throw(rc.Read(reader))
 
 			if !done {
@@ -365,18 +343,12 @@ func (g *Gofra) udpReader(idx int, s *net.UDPConn) *Exception {
 				payload := make([]byte, virtioNetHdrLen+len(inner))
 				copy(payload[virtioNetHdrLen:], inner)
 
-				b, ok := pending[p]
-				if !ok {
-					b = &batch{items: make([]rxItem, 0, batchSize)}
-					pending[p] = b
-				}
+				grouped[p] = append(grouped[p], rxItem{seq: seq, payload: payload})
+			}
 
-				b.items = append(b.items, rxItem{seq: seq, payload: payload})
-
-				if len(b.items) >= batchSize {
-					p.rx.in <- b
-					delete(pending, p)
-				}
+			for p, items := range grouped {
+				p.rx.in <- &batch{items: items}
+				delete(grouped, p)
 			}
 		}
 	})

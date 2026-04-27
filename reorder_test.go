@@ -59,14 +59,14 @@ func drainTo(fakes []*fakeTun, expected uint64, deadline time.Duration) bool {
 
 // BenchmarkReorderPipeline measures end-to-end pps from `pipe.in`
 // → fakeTun.Write through the reorder + writer fan-out. Each b.N
-// iteration ships one batch (batchSize items), so packets/sec =
-// batchSize × benchmark rate.
+// iteration ships one batch (synthBatchSize items), so packets/sec =
+// synthBatchSize × benchmark rate.
 func BenchmarkReorderPipeline(b *testing.B) {
 	const payloadLen = virtioNetHdrLen + 1400
 
 	fakes, writers := makeFakeWriters(4)
 
-	pipe := newReorderPipe(time.Millisecond, time.Millisecond, writers, silentLogger())
+	pipe := newReorderPipe(time.Millisecond, writers, silentLogger())
 	defer pipe.close()
 
 	rng := rand.New(rand.NewSource(1))
@@ -76,10 +76,10 @@ func BenchmarkReorderPipeline(b *testing.B) {
 	batches := make([]*batch, b.N)
 
 	for i := range batches {
-		batches[i] = shuffledBatch(rng, uint32(i*batchSize), batchSize, payloadLen)
+		batches[i] = shuffledBatch(rng, uint32(i*synthBatchSize), synthBatchSize, payloadLen)
 	}
 
-	expected := uint64(b.N) * uint64(batchSize)
+	expected := uint64(b.N) * uint64(synthBatchSize)
 
 	b.ResetTimer()
 
@@ -108,15 +108,15 @@ func BenchmarkReorderPipelineSorted(b *testing.B) {
 
 	fakes, writers := makeFakeWriters(4)
 
-	pipe := newReorderPipe(time.Millisecond, time.Millisecond, writers, silentLogger())
+	pipe := newReorderPipe(time.Millisecond, writers, silentLogger())
 	defer pipe.close()
 
 	pay := make([]byte, payloadLen)
 	batches := make([]*batch, b.N)
 
 	for i := range batches {
-		items := make([]rxItem, batchSize)
-		base := uint32(i * batchSize)
+		items := make([]rxItem, synthBatchSize)
+		base := uint32(i * synthBatchSize)
 
 		for j := range items {
 			items[j] = rxItem{seq: base + uint32(j), payload: pay}
@@ -125,7 +125,7 @@ func BenchmarkReorderPipelineSorted(b *testing.B) {
 		batches[i] = &batch{items: items}
 	}
 
-	expected := uint64(b.N) * uint64(batchSize)
+	expected := uint64(b.N) * uint64(synthBatchSize)
 
 	b.ResetTimer()
 
@@ -156,16 +156,16 @@ func TestReorderPipelineDelivers(t *testing.T) {
 
 	fakes, writers := makeFakeWriters(4)
 
-	pipe := newReorderPipe(time.Millisecond, time.Millisecond, writers, silentLogger())
+	pipe := newReorderPipe(time.Millisecond, writers, silentLogger())
 	defer pipe.close()
 
 	rng := rand.New(rand.NewSource(42))
 
 	const totalItems = 4096
-	const sentBatches = totalItems / batchSize
+	const sentBatches = totalItems / synthBatchSize
 
 	for i := 0; i < sentBatches; i++ {
-		pipe.in <- shuffledBatch(rng, uint32(i*batchSize), batchSize, payloadLen)
+		pipe.in <- shuffledBatch(rng, uint32(i*synthBatchSize), synthBatchSize, payloadLen)
 	}
 
 	if !drainTo(fakes, totalItems, 2*time.Second) {

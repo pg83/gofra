@@ -219,11 +219,28 @@ int gofra::openTun(ObjPool* pool, const char* dev) {
     pool->make<ScopedFD>(fd);
 
     ifreq ifr = {};
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_VNET_HDR;
     copyIfName(ifr.ifr_name, StringView(dev));
 
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETIFF ") << StringView(dev));
+    }
+
+    // Pin virtio_net_hdr to the legacy 10-byte layout (newer kernels
+    // can advertise the 12-byte virtio_net_hdr_v1; gso.cpp's struct
+    // assumes 10).
+    int hdrSize = 10;
+    if (ioctl(fd, TUNSETVNETHDRSZ, &hdrSize) < 0) {
+        Errno().raise(StringBuilder() << StringView(u8"TUNSETVNETHDRSZ ") << StringView(dev));
+    }
+
+    // Negotiate CSUM + TSO4 offload. Without this, IFF_VNET_HDR
+    // mode reads still work but gso_type is always GSO_NONE — we
+    // pay the per-packet syscall overhead, and the multi-NIC stripe
+    // shreds TCP order. This is the whole point of phase 2.
+    unsigned long off = TUN_F_CSUM | TUN_F_TSO4;
+    if (ioctl(fd, TUNSETOFFLOAD, off) < 0) {
+        Errno().raise(StringBuilder() << StringView(u8"TUNSETOFFLOAD ") << StringView(dev));
     }
 
     return fd;

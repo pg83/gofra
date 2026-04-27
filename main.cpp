@@ -82,14 +82,17 @@ namespace {
         // helpers, which together can use a few KiB of frame space.
         constexpr size_t stackSize = 32 * 1024;
 
-        // N tunReader + N udpReader, paired by index.
+        // N tunReader + N udpReader, paired by index. Allocate
+        // per-coroutine GSO scratch up front (single-threaded; pool
+        // isn't thread-safe), then hand pointers to the lambdas.
         for (size_t i = 0; i < n; ++i) {
             int tunFd = tunFds[i];
             int srcFd = conns->srcFd(i);
+            auto* scratch = makeTunReaderScratch(pool.mutPtr());
 
             exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable(
-                [reactor, tunFd, conns, mtu = cfg->tunMtu] {
-                    tunReader(reactor, tunFd, conns, mtu);
+                [reactor, tunFd, conns, scratch] {
+                    tunReader(reactor, tunFd, conns, scratch);
                 }));
 
             exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable(

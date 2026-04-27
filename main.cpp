@@ -54,15 +54,12 @@ namespace {
         auto cfg = loadConfig(pool.mutPtr(), configPath);
 
         int tunFd = openTun(pool.mutPtr(), cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
-        int udpFd = openUdpSocket(pool.mutPtr(), &cfg->underlay[0], cfg->udpRecvBuf, cfg->udpSendBuf);
+        int udpFd = openUdpSocket(pool.mutPtr(), cfg->self->dst(0), cfg->udpRecvBuf, cfg->udpSendBuf);
 
         sysE << StringView(u8"gofra2: tun=") << StringView(cfg->tunDev)
              << StringView(u8" mtu=") << (u64)cfg->tunMtu
-             << StringView(u8" peers=") << (u64)cfg->peers.length()
+             << StringView(u8" peers=") << (u64)cfg->peers->size()
              << endL;
-
-        auto peers = pool->make<PeerTable>(pool.mutPtr());
-        peers->load(*cfg);
 
         auto exec = CoroExecutor::create(pool.mutPtr(), 8);
         auto reactor = exec->io();
@@ -73,7 +70,7 @@ namespace {
         constexpr size_t stackSize = 32 * 1024;
 
         exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable([&] {
-            tunReader(reactor, tunFd, udpFd, peers, cfg->tunMtu);
+            tunReader(reactor, tunFd, udpFd, cfg->peers, cfg->tunMtu);
         }));
 
         exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable([&] {

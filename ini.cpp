@@ -15,7 +15,7 @@ namespace {
         Buffer full_;
 
         IniError(Buffer&& m) noexcept
-            : msg_(move(m))
+            : msg_(static_cast<Buffer&&>(m))
         {
         }
 
@@ -27,7 +27,7 @@ namespace {
     };
 
     [[noreturn]] void raise(Buffer&& msg) {
-        throw IniError(move(msg));
+        throw IniError(static_cast<Buffer&&>(msg));
     }
 }
 

@@ -51,16 +51,14 @@ udp_b=${3:-1G}
 mkdir -p "$TMP"
 
 cat > "$TMP/local.ini" <<EOF
-listen_port = $PORT
-
 [me]
-underlay = $LOCAL_UNDERLAY
-tun_dev  = $TUN
-tun_mtu  = 1280
-tun_vip  = $LOCAL_VIP/24
+vip     = $LOCAL_VIP/24
+tun_dev = $TUN
+tun_mtu = 1280
 
-[peer]
-$LAB1_VIP = $LAB1_UNDERLAY
+[peers]
+$LOCAL_VIP = $LOCAL_UNDERLAY:$PORT
+$LAB1_VIP  = $LAB1_UNDERLAY:$PORT
 
 [udp]
 recv_buf = 16777216
@@ -68,16 +66,14 @@ send_buf = 16777216
 EOF
 
 cat > "$TMP/lab1.ini" <<EOF
-listen_port = $PORT
-
 [me]
-underlay = $LAB1_UNDERLAY
-tun_dev  = $TUN
-tun_mtu  = 1280
-tun_vip  = $LAB1_VIP/24
+vip     = $LAB1_VIP/24
+tun_dev = $TUN
+tun_mtu = 1280
 
-[peer]
-$LOCAL_VIP = $LOCAL_UNDERLAY
+[peers]
+$LOCAL_VIP = $LOCAL_UNDERLAY:$PORT
+$LAB1_VIP  = $LAB1_UNDERLAY:$PORT
 
 [udp]
 recv_buf = 16777216

@@ -56,7 +56,7 @@ void gofra::tunReader(IoReactor* reactor, int tunFd, int udpFd, PeerTable* peers
             continue;
         }
 
-        const sockaddr_in* dst = pickDst(peer);
+        const sockaddr_in* dst = peer->pickDst();
 
         size_t sent = 0;
         err = reactor->sendto(udpFd, &sent, buf, n, (const sockaddr*)dst, sizeof(*dst), NEVER);

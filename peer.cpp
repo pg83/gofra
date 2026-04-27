@@ -1,24 +1,137 @@
 #include "peer.h"
-#include "config.h"
+#include "addr.h"
+#include "ini.h"
 
+#include <std/lib/buffer.h>
+#include <std/lib/vector.h>
 #include <std/mem/obj_pool.h>
+#include <std/str/builder.h>
+#include <std/str/view.h>
+#include <std/sym/i_map.h>
 #include <std/sys/atomic.h>
+#include <std/sys/throw.h>
 
 #include <netinet/in.h>
 
 using namespace stl;
 using namespace gofra;
 
-void PeerTable::load(const Config& cfg) {
-    for (size_t i = 0; i < cfg.peers.length(); ++i) {
-        auto p = cfg.peers[i];
-        byVip_.insert(p->vip, p);
+namespace {
+    struct PeerError: public Exception {
+        Buffer msg_;
+        Buffer full_;
+
+        PeerError(Buffer&& m) noexcept
+            : msg_(static_cast<Buffer&&>(m))
+        {
+        }
+
+        ExceptionKind kind() const noexcept override {
+            return ExceptionKind::Verify;
+        }
+
+        StringView description() override;
+    };
+
+    [[noreturn]] void raise(Buffer&& msg) {
+        throw PeerError(static_cast<Buffer&&>(msg));
+    }
+
+    struct PeerImpl: public Peer {
+        u32 vip_;
+        Vector<sockaddr_in> dsts_;
+        u64 rr_ = 0;
+
+        explicit PeerImpl(u32 vip) noexcept
+            : vip_(vip)
+        {
+        }
+
+        u32 vip() const noexcept override {
+            return vip_;
+        }
+
+        size_t dstCount() const noexcept override {
+            return dsts_.length();
+        }
+
+        const sockaddr_in* dst(size_t i) const noexcept override {
+            return &dsts_[i];
+        }
+
+        const sockaddr_in* pickDst() noexcept override;
+    };
+
+    struct PeerTableImpl: public PeerTable {
+        Vector<Peer*> peers_;
+        IntMap<Peer*> byVip_;
+
+        PeerTableImpl(ObjPool* pool, ini::Section* sec);
+
+        size_t size() const noexcept override {
+            return peers_.length();
+        }
+
+        Peer* lookup(u32 vip) const noexcept override;
+    };
+}
+
+StringView PeerError::description() {
+    if (!full_.empty()) {
+        return full_;
+    }
+
+    (StringBuilder()
+     << StringView(u8"peer: ")
+     << msg_)
+        .xchg(full_);
+
+    return full_;
+}
+
+const sockaddr_in* PeerImpl::pickDst() noexcept {
+    u64 c = stdAtomicAddAndFetch(&rr_, (u64)1, MemoryOrder::Relaxed) - 1;
+    size_t i = (size_t)(c % dsts_.length());
+    return &dsts_[i];
+}
+
+PeerTableImpl::PeerTableImpl(ObjPool* pool, ini::Section* sec)
+    : byVip_(pool)
+{
+    if (!sec || sec->keys.length() == 0) {
+        raise(StringBuilder() << StringView(u8"empty [peers] section"));
+    }
+
+    for (size_t i = 0; i < sec->keys.length(); ++i) {
+        StringView vipStr = sec->keys[i];
+        StringView dstStr = *sec->map.find(vipStr);
+
+        u32 vip;
+        u8 plen;
+        parseCIDR(vipStr, &vip, &plen);
+
+        auto p = pool->make<PeerImpl>(vip);
+
+        forEachItem(dstStr, [&](StringView it) {
+            p->dsts_.pushBack(parseSockAddr(it));
+        });
+
+        if (p->dsts_.length() == 0) {
+            raise(StringBuilder() << StringView(u8"peer ") << vipStr << StringView(u8" has no dsts"));
+        }
+
+        peers_.pushBack(p);
+        byVip_.insert(vip, p);
     }
 }
 
-Peer* PeerTable::lookup(u32 vip) const noexcept {
+Peer* PeerTableImpl::lookup(u32 vip) const noexcept {
     auto found = byVip_.find(vip);
     return found ? *found : nullptr;
+}
+
+PeerTable* PeerTable::create(ObjPool* pool, ini::Section* sec) {
+    return pool->make<PeerTableImpl>(pool, sec);
 }
 
 bool gofra::dstFromIPv4(const u8* pkt, size_t len, u32* out) noexcept {
@@ -35,10 +148,4 @@ bool gofra::dstFromIPv4(const u8* pkt, size_t len, u32* out) noexcept {
     *out = v;
 
     return true;
-}
-
-const sockaddr_in* gofra::pickDst(Peer* peer) noexcept {
-    u64 c = stdAtomicAddAndFetch(&peer->rr, (u64)1, MemoryOrder::Relaxed) - 1;
-    size_t i = (size_t)(c % peer->dsts.length());
-    return &peer->dsts[i];
 }

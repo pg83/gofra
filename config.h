@@ -1,9 +1,6 @@
 #pragma once
 
 #include <std/sys/types.h>
-#include <std/lib/vector.h>
-
-#include <netinet/in.h>
 
 namespace stl {
     class ObjPool;
@@ -11,17 +8,17 @@ namespace stl {
 }
 
 namespace gofra {
-    struct Peer;  // peer.h owns the definition
+    struct Peer;
+    struct PeerTable;
 
     struct Config {
-        u16 listenPort;
-        u32 tunVip;       // inner IPv4 of `me` (host byte order)
+        u32 tunVip;       // our overlay VIP, host byte order
         u8 tunPrefixLen;  // CIDR prefix
         int tunMtu;
         const char* tunDev;  // NUL-terminated; copied into ifr_name for ioctls
 
-        stl::Vector<sockaddr_in> underlay;  // local underlay addrs (port = listenPort)
-        stl::Vector<Peer*> peers;
+        PeerTable* peers;  // every cluster row, us included
+        Peer* self;        // peers->lookup(tunVip) — our row, used for binding
 
         int udpRecvBuf;
         int udpSendBuf;

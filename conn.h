@@ -14,13 +14,10 @@ namespace gofra {
 
     // One precomputed slot in a Conn's stripe array. srcAddr is purely
     // informational (the self underlay this slot's socket is bound on);
-    // dstAddr + srcFd are what tunReader hands to sendto. srcIdx is
-    // the slot's position in ConnTable's srcFds array — used to
-    // bucket segments by source socket for sendmmsg(2) on TX.
+    // dstAddr + srcFd are what tunReader hands to sendmsg.
     struct ConnSlot {
         const sockaddr* srcAddr;
         int srcFd;
-        u32 srcIdx;
         const sockaddr* dstAddr;
     };
 

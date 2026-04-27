@@ -14,6 +14,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
 
 using namespace stl;
 using namespace gofra;
@@ -25,42 +27,25 @@ using namespace gofra;
 // buffers (MTU + slack) and a parallel pointer table so gsoSplit
 // can address them as `u8* const*`.
 //
-// On TX we batch via sendmmsg(2): one bucket per local source
-// socket, segments routed by stripe slot srcIdx. Each non-empty
-// bucket is drained with one syscall regardless of how many
-// segments landed in it (worst case N≈4 syscalls per super-packet
-// instead of up to MAX_SEGS sendto's).
+// On TX we use UDP_SEGMENT (USO): the N segments are scatter-
+// gathered as iovecs in one sendmsg, the kernel/NIC re-segments
+// the concatenated payload into N UDP datagrams of gso_size each.
+// One syscall per super-packet, all segments through one (src,dst)
+// pair so within-flow ordering is preserved.
 struct gofra::TunReaderScratch {
     static constexpr size_t MAX_SEGS  = 64;
     static constexpr size_t SEG_SIZE  = 2048;            // MTU + slack
     static constexpr size_t READ_SIZE = 10 + 65535 + 128;
 
-    struct TxBucket {
-        int srcFd;
-        size_t count;
-        mmsghdr msgs[MAX_SEGS];
-        iovec iovs[MAX_SEGS];
-    };
-
     u8 readBuf[READ_SIZE];
     u8 segBufs[MAX_SEGS][SEG_SIZE];
     u8* segPtrs[MAX_SEGS];
     size_t segSizes[MAX_SEGS];
+    iovec iovs[MAX_SEGS];
 
-    size_t numBuckets;
-    TxBucket* buckets;
-
-    TunReaderScratch(ObjPool* pool, ConnTable* conns) noexcept {
+    TunReaderScratch() noexcept {
         for (size_t i = 0; i < MAX_SEGS; ++i) {
             segPtrs[i] = segBufs[i];
-        }
-
-        numBuckets = conns->srcCount();
-        buckets = (TxBucket*)pool->allocate(numBuckets * sizeof(TxBucket));
-
-        for (size_t i = 0; i < numBuckets; ++i) {
-            buckets[i].srcFd = conns->srcFd(i);
-            buckets[i].count = 0;
         }
     }
 };
@@ -130,53 +115,68 @@ namespace {
         }
     }
 
-    // Send `segs` segments by bucketing them per srcFd via the stripe
-    // counter, then issuing one sendmmsg per non-empty bucket. The
-    // dst per segment is taken from the slot, so different (src,dst)
-    // pairs land in different buckets *and* different mmsghdrs within
-    // the bucket — each msghdr carries its own msg_name.
-    void sendBatch(Conn* conn, TunReaderScratch* sc, int segs) {
-        for (size_t b = 0; b < sc->numBuckets; ++b) {
-            sc->buckets[b].count = 0;
-        }
+    // Send the N gsoSplit segments via sendmsg + UDP_SEGMENT cmsg.
+    // The segments are scatter-gathered as iovecs; the kernel
+    // concatenates them and re-segments by gso_size into UDP
+    // datagrams. gsoSplit's output guarantees [0..N-2] are equal-
+    // sized and the last is ≤ that size — exactly what UDP_SEGMENT
+    // expects.
+    //
+    // The kernel caps each sendmsg super-payload at IP_MAX_MTU
+    // (~65515 B) since the GSO super-skb is one IP datagram from
+    // its POV. With ~46 MTU-sized segments we sit right at the
+    // edge, so we chunk: each chunk is ≤ MAX_USO_BYTES and only
+    // the last segment of the FINAL chunk may be smaller than
+    // gso_size (gsoSplit's invariant). All chunks reuse one stripe
+    // slot, so the per-super-packet stripe semantics hold.
+    constexpr size_t MAX_USO_BYTES = 60 * 1024;
 
-        for (int i = 0; i < segs; ++i) {
-            auto* slot = conn->next();
-            auto* bk = &sc->buckets[slot->srcIdx];
-            size_t k = bk->count++;
+    void sendUso(Conn* conn, TunReaderScratch* sc, int segs) {
+        auto* slot = conn->next();
+        u16 gsoSize = (u16)sc->segSizes[0];
 
-            bk->iovs[k].iov_base = sc->segBufs[i];
-            bk->iovs[k].iov_len  = sc->segSizes[i];
+        int i = 0;
 
-            auto& mh = bk->msgs[k].msg_hdr;
-            mh.msg_name       = (void*)slot->dstAddr;
-            mh.msg_namelen    = addrLen(slot->dstAddr);
-            mh.msg_iov        = &bk->iovs[k];
-            mh.msg_iovlen     = 1;
-            mh.msg_control    = nullptr;
-            mh.msg_controllen = 0;
-            mh.msg_flags      = 0;
-            bk->msgs[k].msg_len = 0;
-        }
+        while (i < segs) {
+            size_t total = 0;
+            int j = i;
 
-        for (size_t b = 0; b < sc->numBuckets; ++b) {
-            auto* bk = &sc->buckets[b];
-
-            if (!bk->count) {
-                continue;
+            while (j < segs && total + sc->segSizes[j] <= MAX_USO_BYTES) {
+                sc->iovs[j].iov_base = sc->segBufs[j];
+                sc->iovs[j].iov_len  = sc->segSizes[j];
+                total += sc->segSizes[j];
+                ++j;
             }
 
-            int sent = ::sendmmsg(bk->srcFd, bk->msgs, (unsigned)bk->count, 0);
+            msghdr msg = {};
+            msg.msg_name    = (void*)slot->dstAddr;
+            msg.msg_namelen = addrLen(slot->dstAddr);
+            msg.msg_iov     = &sc->iovs[i];
+            msg.msg_iovlen  = (size_t)(j - i);
 
-            if (sent < 0) {
-                warnErrno(StringView(u8"udp sendmmsg"), errno);
+            alignas(cmsghdr) char cbuf[CMSG_SPACE(sizeof(u16))];
+            msg.msg_control    = cbuf;
+            msg.msg_controllen = sizeof(cbuf);
+
+            cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+            cm->cmsg_level = SOL_UDP;
+            cm->cmsg_type  = UDP_SEGMENT;
+            cm->cmsg_len   = CMSG_LEN(sizeof(u16));
+            *(u16*)CMSG_DATA(cm) = gsoSize;
+
+            ssize_t r = ::sendmsg(slot->srcFd, &msg, 0);
+
+            if (r < 0) {
+                warnErrno(StringView(u8"udp sendmsg(USO)"), errno);
             }
+
+            i = j;
         }
     }
 }
 
-TunReaderScratch* gofra::makeTunReaderScratch(ObjPool* pool, ConnTable* conns) {
-    return pool->make<TunReaderScratch>(pool, conns);
+TunReaderScratch* gofra::makeTunReaderScratch(ObjPool* pool) {
+    return pool->make<TunReaderScratch>();
 }
 
 UdpReaderScratch* gofra::makeUdpReaderScratch(ObjPool* pool) {
@@ -229,7 +229,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
                 continue;
             }
 
-            sendBatch(conn, sc, segs);
+            sendUso(conn, sc, segs);
             continue;
         }
 

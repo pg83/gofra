@@ -19,7 +19,7 @@ namespace gofra {
     // pre-wired). Same lifetime story as TunReaderScratch.
     struct UdpReaderScratch;
 
-    TunReaderScratch* makeTunReaderScratch(stl::ObjPool* pool, ConnTable* conns);
+    TunReaderScratch* makeTunReaderScratch(stl::ObjPool* pool);
     UdpReaderScratch* makeUdpReaderScratch(stl::ObjPool* pool);
 
     // tunReader: blocking read(tunFd) loop. Decodes virtio_net_hdr,

@@ -91,7 +91,6 @@ ConnTableImpl::ConnTableImpl(ObjPool* pool, PeerTable* peers, Peer* self, int rc
                 auto* s = pool->make<ConnSlot>(ConnSlot{
                     self->dst(i),
                     srcFds_[i],
-                    (u32)i,
                     p->dst(j),
                 });
 

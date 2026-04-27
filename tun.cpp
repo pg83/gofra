@@ -64,8 +64,9 @@ namespace {
     }
 
     // Thin RAII wrapper around an mnl_socket bound to NETLINK_ROUTE.
-    // run(nh, what) sends the request and consumes the ACK; throws on
-    // any failure with `what` as a tag.
+    // Each setMtu/addAddr/linkUp builds one rtnetlink message and runs
+    // it via run(); run() throws on send / recv / ACK error tagged
+    // with `what`.
     struct Netlink {
         mnl_socket* nl;
         u32 portId;
@@ -85,72 +86,10 @@ namespace {
         }
 
         void run(nlmsghdr* nh, StringView what);
+        void setMtu(int idx, int mtu);
+        void addAddr(int idx, u32 vip, u8 prefixLen);
+        void linkUp(int idx);
     };
-
-    void setMtu(Netlink& nl, int idx, int mtu) {
-        alignas(u32) char buf[NL_BUF];
-        nlmsghdr* nh = mnl_nlmsg_put_header(buf);
-        nh->nlmsg_type = RTM_NEWLINK;
-        nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-        nh->nlmsg_seq = nl.nextSeq();
-
-        ifinfomsg* ifi = (ifinfomsg*)mnl_nlmsg_put_extra_header(nh, sizeof(ifinfomsg));
-        ifi->ifi_family = AF_UNSPEC;
-        ifi->ifi_index = idx;
-        ifi->ifi_flags = 0;
-        ifi->ifi_change = 0;
-
-        mnl_attr_put_u32(nh, IFLA_MTU, (u32)mtu);
-
-        nl.run(nh, StringView(u8"RTM_NEWLINK MTU"));
-    }
-
-    void addAddr(Netlink& nl, int idx, u32 vip, u8 prefixLen) {
-        alignas(u32) char buf[NL_BUF];
-        nlmsghdr* nh = mnl_nlmsg_put_header(buf);
-        nh->nlmsg_type = RTM_NEWADDR;
-        nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
-        nh->nlmsg_seq = nl.nextSeq();
-
-        ifaddrmsg* ifa = (ifaddrmsg*)mnl_nlmsg_put_extra_header(nh, sizeof(ifaddrmsg));
-        ifa->ifa_family = AF_INET;
-        ifa->ifa_prefixlen = prefixLen;
-        ifa->ifa_flags = 0;
-        ifa->ifa_scope = RT_SCOPE_UNIVERSE;
-        ifa->ifa_index = (u32)idx;
-
-        // host-order vip → network-order on the wire.
-        u32 vipNet = htonl(vip);
-        mnl_attr_put_u32(nh, IFA_LOCAL, vipNet);
-        mnl_attr_put_u32(nh, IFA_ADDRESS, vipNet);
-
-        // Broadcast = vip | host-mask. Skip for /32 (no broadcast).
-        if (prefixLen < 32) {
-            u32 hostMask = (prefixLen == 0)
-                ? 0xFFFFFFFFu
-                : ((1u << (32 - prefixLen)) - 1u);
-            u32 brd = htonl(vip | hostMask);
-            mnl_attr_put_u32(nh, IFA_BROADCAST, brd);
-        }
-
-        nl.run(nh, StringView(u8"RTM_NEWADDR"));
-    }
-
-    void linkUp(Netlink& nl, int idx) {
-        alignas(u32) char buf[NL_BUF];
-        nlmsghdr* nh = mnl_nlmsg_put_header(buf);
-        nh->nlmsg_type = RTM_NEWLINK;
-        nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-        nh->nlmsg_seq = nl.nextSeq();
-
-        ifinfomsg* ifi = (ifinfomsg*)mnl_nlmsg_put_extra_header(nh, sizeof(ifinfomsg));
-        ifi->ifi_family = AF_UNSPEC;
-        ifi->ifi_index = idx;
-        ifi->ifi_flags = IFF_UP;
-        ifi->ifi_change = IFF_UP;
-
-        nl.run(nh, StringView(u8"RTM_NEWLINK UP"));
-    }
 
     // Configure addr/mtu/up via rtnetlink. Mirrors what gofra1's
     // vishvananda/netlink does — proper NEWADDR with all the right
@@ -161,9 +100,9 @@ namespace {
         int idx = ifIndexFor(dev);
 
         Netlink nl;
-        setMtu(nl, idx, mtu);
-        addAddr(nl, idx, vip, prefixLen);
-        linkUp(nl, idx);
+        nl.setMtu(idx, mtu);
+        nl.addAddr(idx, vip, prefixLen);
+        nl.linkUp(idx);
     }
 }
 
@@ -201,6 +140,71 @@ void Netlink::run(nlmsghdr* nh, StringView what) {
         Errno().raise(StringBuilder() << what
                       << StringView(u8": netlink ack"));
     }
+}
+
+void Netlink::setMtu(int idx, int mtu) {
+    alignas(u32) char buf[NL_BUF];
+    nlmsghdr* nh = mnl_nlmsg_put_header(buf);
+    nh->nlmsg_type = RTM_NEWLINK;
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nh->nlmsg_seq = nextSeq();
+
+    ifinfomsg* ifi = (ifinfomsg*)mnl_nlmsg_put_extra_header(nh, sizeof(ifinfomsg));
+    ifi->ifi_family = AF_UNSPEC;
+    ifi->ifi_index = idx;
+    ifi->ifi_flags = 0;
+    ifi->ifi_change = 0;
+
+    mnl_attr_put_u32(nh, IFLA_MTU, (u32)mtu);
+
+    run(nh, StringView(u8"RTM_NEWLINK MTU"));
+}
+
+void Netlink::addAddr(int idx, u32 vip, u8 prefixLen) {
+    alignas(u32) char buf[NL_BUF];
+    nlmsghdr* nh = mnl_nlmsg_put_header(buf);
+    nh->nlmsg_type = RTM_NEWADDR;
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    nh->nlmsg_seq = nextSeq();
+
+    ifaddrmsg* ifa = (ifaddrmsg*)mnl_nlmsg_put_extra_header(nh, sizeof(ifaddrmsg));
+    ifa->ifa_family = AF_INET;
+    ifa->ifa_prefixlen = prefixLen;
+    ifa->ifa_flags = 0;
+    ifa->ifa_scope = RT_SCOPE_UNIVERSE;
+    ifa->ifa_index = (u32)idx;
+
+    // host-order vip → network-order on the wire.
+    u32 vipNet = htonl(vip);
+    mnl_attr_put_u32(nh, IFA_LOCAL, vipNet);
+    mnl_attr_put_u32(nh, IFA_ADDRESS, vipNet);
+
+    // Broadcast = vip | host-mask. Skip for /32 (no broadcast).
+    if (prefixLen < 32) {
+        u32 hostMask = (prefixLen == 0)
+            ? 0xFFFFFFFFu
+            : ((1u << (32 - prefixLen)) - 1u);
+        u32 brd = htonl(vip | hostMask);
+        mnl_attr_put_u32(nh, IFA_BROADCAST, brd);
+    }
+
+    run(nh, StringView(u8"RTM_NEWADDR"));
+}
+
+void Netlink::linkUp(int idx) {
+    alignas(u32) char buf[NL_BUF];
+    nlmsghdr* nh = mnl_nlmsg_put_header(buf);
+    nh->nlmsg_type = RTM_NEWLINK;
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nh->nlmsg_seq = nextSeq();
+
+    ifinfomsg* ifi = (ifinfomsg*)mnl_nlmsg_put_extra_header(nh, sizeof(ifinfomsg));
+    ifi->ifi_family = AF_UNSPEC;
+    ifi->ifi_index = idx;
+    ifi->ifi_flags = IFF_UP;
+    ifi->ifi_change = IFF_UP;
+
+    run(nh, StringView(u8"RTM_NEWLINK UP"));
 }
 
 int gofra::openTun(ObjPool* pool, const char* dev, int mtu, u32 vip, u8 prefixLen) {

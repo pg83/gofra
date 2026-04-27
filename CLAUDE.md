@@ -14,57 +14,78 @@
 
 ## Mental model
 
-Single-file daemon. `main.go` parses flags, loads JSON config, builds a
-`Gofra` (TUN + N UDP sockets + peer table), runs the data plane.
+C++ daemon on top of `std/`. `main.cpp` parses flags, loads the INI
+config, opens N TUN queues + N UDP sockets, spawns 2*N OS threads
+via `stl::Thread`, runs the data plane.
 
 ```
 [kernel TCP/IP]
-    │  (kernel routing — overlay IPs go via gofra0)
+    │  (kernel routing — overlay IPs go via gofra20)
     ▼
-[TUN gofra0] ── tun.Read ──┐
-                            ├── stripe.go: tunReader
-                            │     dst := dstFromIPv4(buf)
-                            │     p   := peers[dst]
-                            │     n   := p.rr++
-                            │     socks[n%N].WriteToUDPAddrPort(buf, p.dsts[(n/N)%M])
-                            │
-[UDP src×N sockets] ── udpReader ── tun.Write ──> [kernel]
+[TUN gofra20] ── read ──┐
+                         ├── plane.cpp: tunReader (per queue)
+                         │     decode 10-byte virtio_net_hdr
+                         │     gsoSplit on GSO_TCPV4 → N MTU segments
+                         │     for each: conn = conns->lookup(dst)
+                         │              slot = conn->next() (atomic)
+                         │              sendto(slot.srcFd, slot.dstAddr)
+                         │
+[N UDP sockets] ── recvmmsg(64) ── plane.cpp: udpReader (per socket)
+                                    write [10 zero hdr | payload] → tuns[i]
 ```
 
-* TX path: 1 goroutine reading TUN, dispatching to one of N sockets.
-* RX path: N goroutines (one per socket) writing to the TUN directly.
-* Peer dispatch: `map[netip.Addr]*peer` keyed by inner dst IP.
-* Stripe: per-peer `atomic.Uint64` counter walks the full (srcs×dsts)
-  matrix with `srcIdx = c % N`, `dstIdx = (c / N) % M`.
+* TX path: N OS threads, one per TUN queue. Each blocks on
+  `read(tunFd)`; on GSO_TCPV4 the super-packet is split in user-space
+  via `gsoSplit` (vendored from wireguard-go), each MTU segment
+  handed to `Conn::next()` which atomically picks the next slot in
+  the per-peer N*M (srcFd × dstAddr) stripe array.
+* RX path: N OS threads, one per UDP socket. Each blocks on
+  `recvmmsg(MSG_WAITFORONE)` to drain up to 64 packets per syscall,
+  then writes each to the paired TUN queue with a zeroed 10-byte
+  `virtio_net_hdr` prefix (kernel reads as gso_type=NONE).
+* TUN open: `IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_VNET_HDR`,
+  `TUNSETVNETHDRSZ=10`, `TUNSETOFFLOAD(TUN_F_CSUM | TUN_F_TSO4)`.
+* iface mtu/addr/up via rtnetlink (`libmnl`). The legacy SIOCSIF*
+  ioctl path silently drops egress on a /24 P2P TUN.
+* Stripe: per-`Conn` `atomic_uint64` rr counter walks the pre-built
+  N*M slot array (laid out so `rr % N` rotates src fast, `rr / N`
+  rotates dst slow — matches gofra-go's stripe formula).
 
 There's no header on the wire. The UDP payload IS the inner IP
-packet; receiver hands it to TUN and the kernel sees a normal packet.
+packet; receiver hands it to TUN with the zero virtio_net_hdr
+prefix and the kernel sees a normal packet.
 
 ## What lives where
 
 | file | purpose |
 |------|---------|
-| `main.go` | flags, signal handling, log init |
-| `config.go` | JSON schema + parse + validate |
-| `tun_linux.go` | `/dev/net/tun` open + IP/MTU/up via netlink |
-| `socks_linux.go` | UDP bind + SO_BINDTODEVICE + iface lookup |
-| `stripe.go` | peer table, RR dispatch, the two reader loops |
+| `main.cpp` | flags, signal handling, thread spawn |
+| `config.h/.cpp` | typed `Config` + `loadConfig` over `ini::parseConfig` |
+| `ini.h/.cpp` | INI tokenizer → `SymbolMap<Section>` (section name → keys + map) |
+| `addr.h/.cpp` | `parseIPv4` / `parseCIDR` / `parseSockAddr` / `forEachItem` |
+| `peer.h/.cpp` | `Peer` and `PeerTable` interfaces (cluster vip → endpoints) |
+| `conn.h/.cpp` | `Conn` and `ConnTable` interfaces — per-peer N*M stripe slots, owns the N UDP sockets |
+| `tun.h/.cpp` | `openTun` + `configureTun` (rtnetlink via libmnl) |
+| `socks.h/.cpp` | `openUdpSocket` (SO_BINDTODEVICE, RCVBUFFORCE, bind) |
+| `csum.h/.cpp` | 16-bit one's-complement TCP/IP checksum primitives (vendored) |
+| `gso.h/.cpp` | `VirtioNetHdr` decode, `gsoSplit` (TCPV4 super-packet → N MTU segments) |
+| `plane.h/.cpp` | `tunReader` / `udpReader` thread entry points + scratch buffers |
 
 ## Running locally
 
-* Linux only (TUN, SO_BINDTODEVICE, netlink).
+* Linux only (TUN, SO_BINDTODEVICE, rtnetlink, recvmmsg).
 * Needs root or `CAP_NET_ADMIN + CAP_NET_RAW`.
-* Underlay IPs in `me.underlay` must already exist on NICs (gofra
-  doesn't add them).
-* Switch must forward L2 between the underlay IPs and the peer's
-  underlay IPs (single broadcast domain in the lab case).
+* Underlay IPs in `[peers][my_vip]` must already exist on local NICs
+  (gofra2 doesn't add them).
+* Switch must forward L2 between every peer's underlay IPs in a
+  single broadcast domain (no routed underlay).
 
 ## Dev workflow
 
 ```sh
-go build ./...            # one binary, no codegen, no vendor
-go vet ./...
-go test ./...             # only when there are tests, currently none
+make -j               # builds gofra2 against ../std/std/libstd.a
+sudo subreaper sh dev/loopback.sh tcp 30   # 30 s TCP smoke over the local→lab2 stripe
+sudo sh dev/perf.sh 30                     # perf record on the deployed cluster gofra2
 ```
 
 ## What's deliberately out of scope
@@ -81,9 +102,12 @@ not gofra.
 
 ## Future hooks (not built)
 
-* `IFF_VNET_HDR` on TUN + `virtio_net_hdr` parsing → kernel TSO/GSO
-  pushes 64K segments, gofra splits to MTU-sized UDP frames before
-  send. Big single-stream win.
-* `recvmmsg` + `sendmmsg` to amortise syscall cost on the data path.
+* `UDP_SEGMENT` (USO) on TX — one `sendmsg` per super-packet with
+  cmsg, kernel/NIC segments to MTU. Drops `gsoSplit` from user-space
+  and amortizes `udp_sendmsg` / qdisc lock through the wireguard-go
+  PR #75 path. Closes the remaining gap to NIC saturation on
+  4×1G underlays.
+* `UDP_GRO` on RX — kernel coalesces incoming UDP packets into
+  super-buffers before handing to user-space; pairs with USO.
 * Optional 4-byte header with seq/path-id for downstream dedup or
   reorder-buffer features. Capability-bit so old peers degrade.

@@ -1,21 +1,21 @@
 #include "socks.h"
 #include "addr.h"
 
-#include <std/lib/buffer.h>
-#include <std/mem/obj_pool.h>
-#include <std/str/view.h>
-#include <std/str/builder.h>
-#include <std/sys/crt.h>
 #include <std/sys/fd.h>
+#include <std/sys/crt.h>
+#include <std/str/view.h>
 #include <std/sys/throw.h>
+#include <std/lib/buffer.h>
+#include <std/str/builder.h>
+#include <std/mem/obj_pool.h>
 
-#include <unistd.h>
 #include <errno.h>
+#include <unistd.h>
+#include <net/if.h>
 #include <ifaddrs.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
-#include <net/if.h>
 
 using namespace stl;
 

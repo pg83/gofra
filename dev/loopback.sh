@@ -1,156 +1,156 @@
 #!/bin/sh
-# Local two-instance gofra2 smoke test using network namespaces.
+# Smoke test: build gofra2 locally, ship it to lab1 via ssh, run
+# one instance on each side, exercise the overlay with iperf3, and
+# leave both gofra2 instances running with their logs streaming to
+# stdout until Ctrl-C / subreaper-driven teardown.
 #
-# Spawns two netns ("a" and "b") connected by a veth pair (carries
-# the underlay traffic) and runs one gofra2 inside each. Each netns
-# has its own TUN with the overlay vip, so the gofra2 instances can
-# stripe packets through the veth without colliding on a shared
-# routing table.
-#
-# We bypass `ip netns add` because the stalix-built iproute2 has a
-# read-only state path baked in. Instead: parallel `unshare --net`
-# of a sleep-forever holder per netns, then move veths and run gofra2
-# inside via `nsenter --target $PID --net`.
-#
-# After setup, runs `iperf3 -s` in netns A and `iperf3 -c` in netns B
-# targeting A's overlay IP. Logs go to /tmp/gofra2-{a,b}.log.
-#
-# Usage:
-#   sudo sh dev/loopback.sh             # 10s TCP iperf3 default
-#   sudo sh dev/loopback.sh tcp 30      # 30s TCP
-#   sudo sh dev/loopback.sh udp 10 3G   # UDP -b 3G for 10s
-#   sudo sh dev/loopback.sh stop        # tear everything down
+# No netns, no veth — the underlay is just nebula between the dev
+# machine and lab1. No manual cleanup either: subreaper kills our
+# children on exit, ssh disconnect SIGHUPs the remote gofra2, and
+# the TUN device is non-persistent so it disappears with the
+# process. Lab1 side files land in $HOME/gofra2-smoke/ (no /tmp on
+# stalix).
 #
 # Layout:
-#   netns A:  tun_a 10.20.0.1/24    veth-a 192.168.99.1/24
-#   netns B:  tun_b 10.20.0.2/24    veth-b 192.168.99.2/24
-#   peer A: 10.20.0.2 -> 192.168.99.2:8050
-#   peer B: 10.20.0.1 -> 192.168.99.1:8050
+#   local: gofra2 bound to $LOCAL_UNDERLAY:$PORT, vip 192.168.110.1/24
+#   lab1:  gofra2 bound to $LAB1_UNDERLAY:$PORT,  vip 192.168.110.2/24
+#
+# Custom port and TUN name so we don't stomp on the deployed
+# cluster gofra2 (port 8050, dev gofra20).
+#
+# Usage:
+#   sudo subreaper sh dev/loopback.sh             # 10s TCP
+#   sudo subreaper sh dev/loopback.sh tcp 30
+#   sudo subreaper sh dev/loopback.sh udp 10 1G
 
-set -xeu
+set -xu
+
+export PATH=/ix/realm/llm/bin:$PATH
 
 GOFRA2=${GOFRA2:-./gofra2}
-TMP=/tmp/gofra2-loop
-LOG_A=/tmp/gofra2-a.log
-LOG_B=/tmp/gofra2-b.log
-PID_A_FILE=$TMP/holder_a.pid
-PID_B_FILE=$TMP/holder_b.pid
+LAB1_HOST=lab1.nebula
+LAB1_UNDERLAY=192.168.100.16
+LOCAL_UNDERLAY=192.168.100.64    # this dev machine's nebula IP — edit if it moves
+PORT=8060
+TUN=gofra2_smoke
+LOCAL_VIP=192.168.110.1
+LAB1_VIP=192.168.110.2
 
-[ "$(id -u)" -eq 0 ] || { echo "need root (sudo)"; exit 1; }
-
-teardown() {
-    [ -f "$PID_A_FILE" ] && kill "$(cat "$PID_A_FILE")" 2>/dev/null || :
-    [ -f "$PID_B_FILE" ] && kill "$(cat "$PID_B_FILE")" 2>/dev/null || :
-
-    pkill -f "$GOFRA2.*$TMP/a.ini" 2>/dev/null || :
-    pkill -f "$GOFRA2.*$TMP/b.ini" 2>/dev/null || :
-    pkill -f "iperf3.*$TMP" 2>/dev/null || :
-
-    sleep 0.3
-    rm -rf "$TMP"
-}
-
-if [ "${1:-}" = "stop" ]; then
-    teardown
-    echo "torn down"
-    exit 0
-fi
+# Local scratch (real /tmp here). Lab side lands in $HOME (no /tmp
+# on stalix); SSH_DIR is referenced as a path RELATIVE to whatever
+# pwd ssh lands in.
+TMP=/tmp/gofra2-smoke
+SSH_DIR=gofra2-smoke
 
 mode=${1:-tcp}
 secs=${2:-10}
 udp_b=${3:-1G}
 
-trap 'teardown' EXIT INT
+[ "$(id -u)" -eq 0 ] || { echo "need root (sudo)" >&2; exit 1; }
 
-# Clean previous run.
-teardown
 mkdir -p "$TMP"
 
-# Spawn a sleep-forever holder inside each new netns. The holder's
-# PID is what we use as the netns handle for `ip link set ... netns`
-# and `nsenter --target`. Killing the holder destroys the netns.
-unshare --net sleep infinity &
-PID_A=$!
-echo "$PID_A" > "$PID_A_FILE"
-
-unshare --net sleep infinity &
-PID_B=$!
-echo "$PID_B" > "$PID_B_FILE"
-
-# Wait for the holders to actually be in their new netns (unshare
-# is fast but not synchronous — give it a tick).
-sleep 0.1
-
-# Underlay veth, created in the main netns then moved.
-ip link add veth-a type veth peer name veth-b
-ip link set veth-a netns "$PID_A"
-ip link set veth-b netns "$PID_B"
-
-nsenter --target "$PID_A" --net ip link set lo up
-nsenter --target "$PID_A" --net ip addr add 192.168.99.1/24 dev veth-a
-nsenter --target "$PID_A" --net ip link set veth-a up
-
-nsenter --target "$PID_B" --net ip link set lo up
-nsenter --target "$PID_B" --net ip addr add 192.168.99.2/24 dev veth-b
-nsenter --target "$PID_B" --net ip link set veth-b up
-
-# INI configs.
-cat > "$TMP/a.ini" <<EOF
-listen_port = 8050
+cat > "$TMP/local.ini" <<EOF
+listen_port = $PORT
 
 [me]
-underlay = 192.168.99.1
-tun_dev  = tun_a
-tun_mtu  = 1400
-tun_vip  = 10.20.0.1/24
+underlay = $LOCAL_UNDERLAY
+tun_dev  = $TUN
+tun_mtu  = 1280
+tun_vip  = $LOCAL_VIP/24
 
 [peer]
-10.20.0.2 = 192.168.99.2
+$LAB1_VIP = $LAB1_UNDERLAY
 
 [udp]
 recv_buf = 16777216
 send_buf = 16777216
 EOF
 
-cat > "$TMP/b.ini" <<EOF
-listen_port = 8050
+cat > "$TMP/lab1.ini" <<EOF
+listen_port = $PORT
 
 [me]
-underlay = 192.168.99.2
-tun_dev  = tun_b
-tun_mtu  = 1400
-tun_vip  = 10.20.0.2/24
+underlay = $LAB1_UNDERLAY
+tun_dev  = $TUN
+tun_mtu  = 1280
+tun_vip  = $LAB1_VIP/24
 
 [peer]
-10.20.0.1 = 192.168.99.1
+$LOCAL_VIP = $LOCAL_UNDERLAY
 
 [udp]
 recv_buf = 16777216
 send_buf = 16777216
 EOF
 
-nsenter --target "$PID_A" --net "$GOFRA2" --config "$TMP/a.ini" >"$LOG_A" 2>&1 &
-nsenter --target "$PID_B" --net "$GOFRA2" --config "$TMP/b.ini" >"$LOG_B" 2>&1 &
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
-# Give them a moment to open the TUN devices and wire up the reactor.
-sleep 0.5
+echo "=== underlay: local=$LOCAL_UNDERLAY  lab1=$LAB1_UNDERLAY ==="
+
+ssh $SSH_OPTS "root@$LAB1_HOST" "mkdir -p $SSH_DIR"
+ssh $SSH_OPTS "root@$LAB1_HOST" "cat > $SSH_DIR/gofra2 && chmod +x $SSH_DIR/gofra2" < "$GOFRA2"
+ssh $SSH_OPTS "root@$LAB1_HOST" "cat > $SSH_DIR/lab1.ini" < "$TMP/lab1.ini"
+
+# Lab1 gofra2 over a held-open ssh; channel close → SIGHUP → exit.
+# `-T` (no pty) + line-buffered redirect via `stdbuf` keep startup
+# log lines from sitting in a pipe block buffer; otherwise the
+# initial "gofra2: tun=..." line takes ages to surface and looks
+# like a hang.
+ssh $SSH_OPTS -T "root@$LAB1_HOST" \
+    "exec $SSH_DIR/gofra2 --config $SSH_DIR/lab1.ini 2>&1" \
+    | sed -u 's/^/[lab1] /' &
+
+# Local gofra2.
+"$GOFRA2" --config "$TMP/local.ini" &
+
+sleep 1
+
+# ssh runs commands with stalix's busybox-only PATH; iproute2's
+# full `ip` lives at the realm path (see feedback memory).
+LAB1_IP=/ix/realm/ip/bin/ip
+
+echo "=== route + iface state ==="
+echo "--- local: route to $LAB1_VIP ---"
+ip route get "$LAB1_VIP" || :
+echo "--- local: ip rule (policy routing) ---"
+ip rule show || :
+echo "--- local: rp_filter / accept_local on $TUN ---"
+for k in rp_filter accept_local forwarding; do
+    f=/proc/sys/net/ipv4/conf/$TUN/$k
+    [ -e "$f" ] && printf '  %s = %s\n' "$k" "$(cat "$f")"
+done
+echo "--- local: nft ruleset ---"
+nft list ruleset 2>&1 | head -20 || :
+echo "--- local: $TUN ---"
+ip -s -s link show "$TUN" || :
+echo "--- lab1: route to $LOCAL_VIP ---"
+ssh $SSH_OPTS "root@$LAB1_HOST" "$LAB1_IP route get $LOCAL_VIP" || :
+echo "--- lab1: $TUN ---"
+ssh $SSH_OPTS "root@$LAB1_HOST" "$LAB1_IP -s -s link show $TUN" || :
 
 echo "=== ping smoke ==="
-nsenter --target "$PID_B" --net ping -c 2 -W 2 10.20.0.1 || echo "(ping failed)"
+ping -c 5 -W 2 "$LAB1_VIP" || echo "(ping failed)"
 
-echo "=== iperf3 ==="
-nsenter --target "$PID_A" --net iperf3 -s -1 -p 5201 >/dev/null 2>&1 &
-sleep 0.3
+echo "=== iface state after ping ==="
+echo "--- local: $TUN ---"
+ip -s -s link show "$TUN" || :
+echo "--- lab1: $TUN ---"
+ssh $SSH_OPTS "root@$LAB1_HOST" "$LAB1_IP -s -s link show $TUN" || :
 
+echo "=== iperf3 server on lab1 ==="
+ssh $SSH_OPTS -T "root@$LAB1_HOST" \
+    "exec iperf3 -s -B $LAB1_VIP -p 5201 2>&1" \
+    | sed -u "s/^/[iperf3 lab1] /" &
+sleep 0.5
+
+echo "=== iperf3 client (mode=$mode duration=${secs}s) ==="
 case "$mode" in
-    tcp) nsenter --target "$PID_B" --net iperf3 -c 10.20.0.1 -p 5201 -t "$secs" ;;
-    udp) nsenter --target "$PID_B" --net iperf3 -c 10.20.0.1 -p 5201 -t "$secs" -u -b "$udp_b" ;;
-    *) echo "mode must be tcp|udp"; exit 1 ;;
+    tcp) iperf3 -c "$LAB1_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" || true ;;
+    udp) iperf3 -c "$LAB1_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" -u -b "$udp_b" || true ;;
+    *)   echo "mode must be tcp|udp" >&2; exit 1 ;;
 esac
 
 echo
-echo "=== gofra2 logs ==="
-echo "--- A ($LOG_A) ---"
-cat "$LOG_A"
-echo "--- B ($LOG_B) ---"
-cat "$LOG_B"
+echo "=== gofra2 still running. Ctrl-C to stop. ==="
+wait

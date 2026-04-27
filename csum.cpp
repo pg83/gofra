@@ -3,8 +3,6 @@
 using namespace gofra;
 
 namespace {
-    // Native-endian load; bswap happens once at the boundary in
-    // checksumNoFold.
     inline u64 loadU64(const u8* p) noexcept {
         u64 v;
         __builtin_memcpy(&v, p, 8);
@@ -25,8 +23,7 @@ namespace {
 }
 
 u64 gofra::checksumNoFold(const u8* data, size_t len, u64 initial) noexcept {
-    // Sum native-endian u64s in a 128-bit accumulator and bswap
-    // once at the boundary; equivalent on LE, saves bswap/word.
+    // Native-endian sum + one bswap at the boundary; saves bswap/word on LE.
     __uint128_t ac = (__uint128_t)__builtin_bswap64(initial);
 
     while (len >= 8) {
@@ -52,7 +49,6 @@ u64 gofra::checksumNoFold(const u8* data, size_t len, u64 initial) noexcept {
         ac += (u64)*data;
     }
 
-    // Fold the high 64 bits.
     u64 lo = (u64)ac;
     u64 hi = (u64)(ac >> 64);
     u64 sum = lo + hi;
@@ -81,12 +77,7 @@ u64 gofra::pseudoHeaderChecksumNoFold(u8 protocol,
     u64 sum = checksumNoFold(srcAddr, addrLen, 0);
     sum = checksumNoFold(dstAddr, addrLen, sum);
 
-    // Pseudo-hdr tail: 0x00 protocol len_hi len_lo
-    u8 tail[4];
-    tail[0] = 0;
-    tail[1] = protocol;
-    tail[2] = (u8)(totalLen >> 8);
-    tail[3] = (u8)totalLen;
+    u8 tail[4] = { 0, protocol, (u8)(totalLen >> 8), (u8)totalLen };
 
     return checksumNoFold(tail, sizeof(tail), sum);
 }

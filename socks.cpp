@@ -20,10 +20,7 @@
 using namespace stl;
 
 namespace {
-    // Iface whose primary IPv4 matches `addr_ne` (NBO). For
-    // SO_BINDTODEVICE: TX must leave on the NIC owning the src IP,
-    // not whatever the routing table picks. Writes NUL-terminated
-    // name into `out`, returns its length.
+    // SO_BINDTODEVICE: TX must leave on the NIC owning src, not what routing picks.
     size_t ifaceFor(u32 addr_ne, char out[IFNAMSIZ]) {
         ifaddrs* ifs = nullptr;
 
@@ -79,14 +76,12 @@ namespace {
 }
 
 int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int sndBuf) {
-    // Blocking — udpReader sleeps in recvmmsg(MSG_WAITFORONE).
     int fd = ::socket(src->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"socket(UDP)"));
     }
 
-    // Pool owns the fd; throws below unwind through ScopedFD.
     pool->make<ScopedFD>(fd);
 
     auto* sin = (const sockaddr_in*)src;

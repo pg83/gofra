@@ -138,7 +138,6 @@ bool gofra::dstFromIPv4(const u8* pkt, size_t len, u32* out) noexcept {
         return false;
     }
 
-    // dst is at offset 16..19, network byte order.
     u32 v = ((u32)pkt[16] << 24) | ((u32)pkt[17] << 16) | ((u32)pkt[18] << 8) | (u32)pkt[19];
     *out = v;
 

@@ -25,7 +25,6 @@
 using namespace stl;
 
 namespace {
-    // Stack buffer for one rtnetlink request; covers any of ours.
     constexpr size_t NL_BUF = 8192;
 
     void copyIfName(char dst[IFNAMSIZ], StringView name) {
@@ -38,15 +37,12 @@ namespace {
         dst[name.length()] = 0;
     }
 
-    // SIOCGIFINDEX is a pure getter; safe (unlike the SIOCSIF*
-    // setters that drop egress on a /24 P2P TUN).
     int ifIndexFor(const char* dev) {
         int rawS = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (rawS < 0) {
             Errno().raise(StringBuilder() << StringView(u8"socket(AF_INET,SOCK_DGRAM)"));
         }
 
-        // Stack RAII; closes on any return / throw.
         ScopedFD s(rawS);
 
         ifreq ifr = {};
@@ -61,9 +57,6 @@ namespace {
         return ifr.ifr_ifindex;
     }
 
-    // RAII over an mnl_socket on NETLINK_ROUTE. setMtu/addAddr/
-    // linkUp each build one message and run() it; run() throws
-    // tagged `what` on any error.
     struct Netlink {
         mnl_socket* nl;
         u32 portId;
@@ -90,8 +83,7 @@ namespace {
 
 }
 
-// Iface mtu/addr/up via rtnetlink — the SIOCSIF* path silently
-// drops egress on a /24 P2P TUN.
+// SIOCSIF* silently drops egress on a /24 P2P TUN; use rtnetlink.
 void gofra::configureTun(const char* dev, int mtu, u32 vip, u8 prefixLen) {
     int idx = ifIndexFor(dev);
 
@@ -177,7 +169,6 @@ void Netlink::addAddr(int idx, u32 vip, u8 prefixLen) {
     mnl_attr_put_u32(nh, IFA_LOCAL, vipNet);
     mnl_attr_put_u32(nh, IFA_ADDRESS, vipNet);
 
-    // Broadcast = vip | host-mask. /32 has none.
     if (prefixLen < 32) {
         u32 hostMask = (prefixLen == 0)
             ? 0xFFFFFFFFu
@@ -212,7 +203,6 @@ int gofra::openTun(ObjPool* pool, const char* dev) {
         Errno().raise(StringBuilder() << StringView(u8"open /dev/net/tun"));
     }
 
-    // Pool owns the fd; throws below unwind through ScopedFD.
     pool->make<ScopedFD>(fd);
 
     ifreq ifr = {};
@@ -223,15 +213,13 @@ int gofra::openTun(ObjPool* pool, const char* dev) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETIFF ") << StringView(dev));
     }
 
-    // Pin to the 10-byte virtio_net_hdr; gso.cpp assumes that.
-    int hdrSize = 10;
+    int hdrSize = 10;  // gso.cpp assumes 10-byte virtio_net_hdr
 
     if (ioctl(fd, TUNSETVNETHDRSZ, &hdrSize) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETVNETHDRSZ ") << StringView(dev));
     }
 
-    // CSUM + TSO4: without it gso_type is always NONE and we eat
-    // a syscall per MTU-sized segment.
+    // Without offload, gso_type is always NONE → syscall/segment.
     unsigned long off = TUN_F_CSUM | TUN_F_TSO4;
 
     if (ioctl(fd, TUNSETOFFLOAD, off) < 0) {

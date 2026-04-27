@@ -9,14 +9,10 @@ using namespace gofra;
 namespace {
     constexpr size_t IPV4_SRC_ADDR_OFFSET = 12;
     constexpr size_t IPV4_ADDR_LEN = 4;
-
-    constexpr size_t TCP_FLAGS_OFFSET = 13;  // within TCP header
-
+    constexpr size_t TCP_FLAGS_OFFSET = 13;
     constexpr u8 TCP_FLAG_FIN = 0x01;
     constexpr u8 TCP_FLAG_PSH = 0x08;
-
     constexpr u8 IPPROTO_TCP_V = 6;
-    constexpr u8 IPPROTO_UDP_V = 17;
 
     inline void putBE16(u8* p, u16 v) noexcept {
         p[0] = (u8)(v >> 8);
@@ -50,7 +46,7 @@ void gofra::zeroVirtioNetHdr(u8* data) noexcept {
 void gofra::gsoNoneChecksum(u8* pkt, size_t pktLen, u16 csumStart, u16 csumOffset) noexcept {
     size_t at = (size_t)csumStart + (size_t)csumOffset;
 
-    // Kernel parked the pseudo-hdr sum at csumOffset; fold L4 onto it.
+    // Kernel parked the pseudo-hdr sum at csumOffset; fold L4 on top.
     u64 initial = (u64)getBE16(pkt + at);
 
     pkt[at] = 0;
@@ -63,7 +59,6 @@ void gofra::gsoNoneChecksum(u8* pkt, size_t pktLen, u16 csumStart, u16 csumOffse
 
 int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
                     u8* const* outBufs, size_t* outSizes, size_t maxSegs) noexcept {
-    // We negotiate TCPV4 only; caller decides on anything else.
     if (hdr.gsoType != VIRTIO_NET_HDR_GSO_TCPV4) {
         return -1;
     }
@@ -74,7 +69,7 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
     const size_t addrLen = IPV4_ADDR_LEN;
     const u8 protocol = IPPROTO_TCP_V;
 
-    // Zero IPv4 + L4 csum fields in `in` for clean recompute below.
+    // Zero IPv4+L4 csum fields in `in` for clean recompute below.
     in[10] = 0;
     in[11] = 0;
 
@@ -106,10 +101,8 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
 
         u8* out = outBufs[i];
 
-        // -- IP header --
         memCpy(out, in, iphLen);
 
-        // IPv4 ID += i; tot_len differs; csum recomputed.
         if (i > 0) {
             u16 id = getBE16(out + 4);
             id = (u16)(id + (u16)i);
@@ -121,7 +114,6 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
         u16 ipv4Csum = (u16)~checksum(out, iphLen, 0);
         putBE16(out + 10, ipv4Csum);
 
-        // -- TCP header --
         const size_t transportHdrLen = hdrTotal - iphLen;
         memCpy(out + iphLen, in + iphLen, transportHdrLen);
 
@@ -133,10 +125,8 @@ int gofra::gsoSplit(u8* in, size_t inLen, const VirtioNetHdr& hdr,
             out[iphLen + TCP_FLAGS_OFFSET] &= (u8)~(TCP_FLAG_FIN | TCP_FLAG_PSH);
         }
 
-        // -- payload --
         memCpy(out + hdrTotal, in + nextDataAt, segDataLen);
 
-        // -- TCP csum --
         const u16 lenForPseudo = (u16)(transportHdrLen + segDataLen);
         const u64 pseudo = pseudoHeaderChecksumNoFold(
             protocol,

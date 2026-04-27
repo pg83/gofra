@@ -12,13 +12,13 @@ namespace gofra {
     struct PeerTable;
 
     struct Config {
-        u32 tunVip;       // our overlay VIP, host byte order
-        u8 tunPrefixLen;  // CIDR prefix
+        u32 tunVip;
+        u8 tunPrefixLen;
         int tunMtu;
-        const char* tunDev;  // NUL-terminated; copied into ifr_name for ioctls
+        const char* tunDev;
 
-        PeerTable* peers;  // every cluster row, us included
-        Peer* self;        // peers->lookup(tunVip) — our row, used for binding
+        PeerTable* peers;
+        Peer* self;
 
         int udpRecvBuf;
         int udpSendBuf;

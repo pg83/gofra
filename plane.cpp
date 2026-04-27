@@ -5,26 +5,25 @@
 
 #include <std/mem/obj_pool.h>
 #include <std/sys/crt.h>
-#include <std/thr/io_reactor.h>
 #include <std/str/view.h>
 #include <std/ios/sys.h>
 
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
 
 using namespace stl;
 using namespace gofra;
 
-// TunReaderScratch is a real type in the gofra namespace (forward-
-// declared in plane.h) so main can pool->make one before spawning
-// the coroutine — ObjPool isn't thread-safe, so all allocation has
-// to happen on the main thread before any worker starts.
+// Per-tunReader scratch.
 //
-// Sized like wireguard-go's tunReader: one super-packet (up to 64
-// KiB inner + 10 B virtio_net_hdr + slack) and up to 64 segment
-// buffers (MTU + slack each), with a parallel pointer table so
-// gsoSplit can address them as `u8* const*`.
+// Wireguard-go's tunReader sizes: one super-packet up to 64 KiB
+// inner + 10 B virtio_net_hdr + slack, plus up to 64 segment
+// buffers (MTU + slack) and a parallel pointer table so gsoSplit
+// can address them as `u8* const*`.
 struct gofra::TunReaderScratch {
     static constexpr size_t MAX_SEGS  = 64;
     static constexpr size_t SEG_SIZE  = 2048;            // MTU + slack
@@ -42,9 +41,44 @@ struct gofra::TunReaderScratch {
     }
 };
 
-namespace {
-    constexpr u64 NEVER = UINT64_MAX;
+// Per-udpReader scratch.
+//
+// 64-deep recvmmsg batch. Each slot's iov_base points 10 bytes
+// into its buffer so the virtio_net_hdr prefix stays zero — when
+// we hand the packet to the TUN it's read as gso_type=NONE / no
+// flags. addr/iov/msghdr indices match buffer index.
+struct gofra::UdpReaderScratch {
+    static constexpr size_t BATCH    = 64;
+    static constexpr size_t MSG_SIZE = 10 + 9000;        // virtio + jumbo
 
+    mmsghdr msgs[BATCH];
+    iovec iovs[BATCH];
+    sockaddr_in addrs[BATCH];
+    u8 bufs[BATCH][MSG_SIZE];
+
+    UdpReaderScratch() noexcept {
+        for (size_t i = 0; i < BATCH; ++i) {
+            // Pre-zero the virtio_net_hdr prefix. recvmmsg writes
+            // into iov_base which is buf + 10; the prefix stays
+            // untouched and zero across iterations.
+            zeroVirtioNetHdr(bufs[i]);
+
+            iovs[i].iov_base = bufs[i] + VIRTIO_NET_HDR_LEN;
+            iovs[i].iov_len  = MSG_SIZE - VIRTIO_NET_HDR_LEN;
+
+            msgs[i].msg_hdr.msg_iov     = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen  = 1;
+            msgs[i].msg_hdr.msg_name    = &addrs[i];
+            msgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+            msgs[i].msg_hdr.msg_control = nullptr;
+            msgs[i].msg_hdr.msg_controllen = 0;
+            msgs[i].msg_hdr.msg_flags   = 0;
+            msgs[i].msg_len             = 0;
+        }
+    }
+};
+
+namespace {
     void warnErrno(StringView what, int err) {
         sysE << StringView(u8"gofra2: ") << what
              << StringView(u8": ")
@@ -57,15 +91,14 @@ namespace {
     }
 
     // Send one fully-formed inner IP packet via the next stripe slot.
-    void sendOne(IoReactor* reactor, Conn* conn, const u8* pkt, size_t len) {
+    void sendOne(Conn* conn, const u8* pkt, size_t len) {
         auto slot = conn->next();
 
-        size_t sent = 0;
-        int err = reactor->sendto(slot->srcFd, &sent, pkt, len,
-                                  (const sockaddr*)slot->dstAddr,
-                                  sizeof(*slot->dstAddr), NEVER);
-        if (err) {
-            warnErrno(StringView(u8"udp sendto"), err);
+        ssize_t r = ::sendto(slot->srcFd, pkt, len, 0,
+                             (const sockaddr*)slot->dstAddr,
+                             sizeof(*slot->dstAddr));
+        if (r < 0) {
+            warnErrno(StringView(u8"udp sendto"), errno);
         }
     }
 }
@@ -74,18 +107,20 @@ TunReaderScratch* gofra::makeTunReaderScratch(ObjPool* pool) {
     return pool->make<TunReaderScratch>();
 }
 
-void gofra::tunReader(IoReactor* reactor, int tunFd, ConnTable* conns,
-                      TunReaderScratch* sc) {
-    for (;;) {
-        size_t n = 0;
-        int err = reactor->read(tunFd, &n, sc->readBuf, sizeof(sc->readBuf), NEVER);
+UdpReaderScratch* gofra::makeUdpReaderScratch(ObjPool* pool) {
+    return pool->make<UdpReaderScratch>();
+}
 
-        if (err) {
-            warnErrno(StringView(u8"tun read"), err);
+void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
+    for (;;) {
+        ssize_t n = ::read(tunFd, sc->readBuf, sizeof(sc->readBuf));
+
+        if (n < 0) {
+            warnErrno(StringView(u8"tun read"), errno);
             continue;
         }
 
-        if (n < VIRTIO_NET_HDR_LEN + 20) {
+        if ((size_t)n < VIRTIO_NET_HDR_LEN + 20) {
             continue;
         }
 
@@ -93,7 +128,7 @@ void gofra::tunReader(IoReactor* reactor, int tunFd, ConnTable* conns,
         decodeVirtioNetHdr(&hdr, sc->readBuf);
 
         u8* inner = sc->readBuf + VIRTIO_NET_HDR_LEN;
-        size_t innerLen = n - VIRTIO_NET_HDR_LEN;
+        size_t innerLen = (size_t)n - VIRTIO_NET_HDR_LEN;
 
         u32 dstVip = 0;
         if (!dstFromIPv4(inner, innerLen, &dstVip)) {
@@ -109,7 +144,7 @@ void gofra::tunReader(IoReactor* reactor, int tunFd, ConnTable* conns,
             if (hdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
                 gsoNoneChecksum(inner, innerLen, hdr.csumStart, hdr.csumOffset);
             }
-            sendOne(reactor, conn, inner, innerLen);
+            sendOne(conn, inner, innerLen);
             continue;
         }
 
@@ -123,48 +158,46 @@ void gofra::tunReader(IoReactor* reactor, int tunFd, ConnTable* conns,
             }
 
             for (int i = 0; i < segs; ++i) {
-                sendOne(reactor, conn, sc->segBufs[i], sc->segSizes[i]);
+                sendOne(conn, sc->segBufs[i], sc->segSizes[i]);
             }
             continue;
         }
 
         // Unsupported gso_type (UDP / TCPV6). With our TUNSETOFFLOAD
-        // mask of CSUM|TSO4, the kernel shouldn't produce these —
-        // drop and log so we notice if the contract changes.
+        // mask of CSUM|TSO4, the kernel shouldn't produce these.
         warn(StringView(u8"tunReader: unsupported gso_type"));
     }
 }
 
-void gofra::udpReader(IoReactor* reactor, int udpFd, int tunFd) {
-    // Layout: [10-byte virtio_net_hdr (kept zero)] [up to ~MTU payload].
-    // Pre-zero the prefix once; the kernel's IFF_VNET_HDR side reads
-    // gso_type=NONE / no flags / no csum work to do, then accepts the
-    // following packet as fully-formed.
-    u8 buf[VIRTIO_NET_HDR_LEN + 10000];
-    zeroVirtioNetHdr(buf);
-
+void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
     for (;;) {
-        size_t n = 0;
-        sockaddr_in src = {};
-        u32 srcLen = sizeof(src);
-
-        int err = reactor->recvfrom(udpFd, &n,
-                                    buf + VIRTIO_NET_HDR_LEN,
-                                    sizeof(buf) - VIRTIO_NET_HDR_LEN,
-                                    (sockaddr*)&src, &srcLen, NEVER);
-        if (err) {
-            warnErrno(StringView(u8"udp recvfrom"), err);
+        // recvmmsg drains up to BATCH packets in one syscall;
+        // MSG_WAITFORONE blocks until at least one is available,
+        // then reaps everything else already queued.
+        int n = ::recvmmsg(udpFd, sc->msgs, UdpReaderScratch::BATCH,
+                           MSG_WAITFORONE, nullptr);
+        if (n < 0) {
+            warnErrno(StringView(u8"udp recvmmsg"), errno);
             continue;
         }
 
-        if (n < 20) {
-            continue;
-        }
+        for (int i = 0; i < n; ++i) {
+            u32 payloadLen = sc->msgs[i].msg_len;
+            if (payloadLen < 20) {
+                continue;
+            }
 
-        size_t written = 0;
-        err = reactor->write(tunFd, &written, buf, VIRTIO_NET_HDR_LEN + n, NEVER);
-        if (err) {
-            warnErrno(StringView(u8"tun write"), err);
+            // Reset namelen for the next round; recvmmsg shrinks it
+            // to the actual sender addr len (16 for IPv4) but we
+            // also rely on the iov_len being preserved across calls.
+            sc->msgs[i].msg_hdr.msg_namelen = sizeof(sc->addrs[i]);
+
+            // [10 B virtio_net_hdr (zeroed once at scratch ctor) | payload].
+            ssize_t w = ::write(tunFd, sc->bufs[i],
+                                VIRTIO_NET_HDR_LEN + payloadLen);
+            if (w < 0) {
+                warnErrno(StringView(u8"tun write"), errno);
+            }
         }
     }
 }

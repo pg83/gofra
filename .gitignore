@@ -3,3 +3,5 @@
 /gofra2
 *.pzd
 *.o
+/perf-*.data
+/kallsyms-*

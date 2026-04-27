@@ -1,35 +1,35 @@
 #pragma once
 
+#include <std/sys/types.h>
+
 namespace stl {
     class ObjPool;
-    struct IoReactor;
 }
 
 namespace gofra {
     struct ConnTable;
 
-    // Per-tunReader scratch space: 64 KiB GSO read buffer + 64 × MTU
-    // segment output buffers. Defined privately in plane.cpp; main
-    // gets an opaque pointer back from makeTunReaderScratch and
-    // hands it to the coroutine. Allocation happens once on the
-    // main thread before any coroutine runs — ObjPool isn't
-    // thread-safe.
+    // Per-tunReader scratch (64 KiB read buffer + 64 × MTU segment
+    // buffers for gsoSplit output). Defined privately in plane.cpp;
+    // pool->make one before the thread starts.
     struct TunReaderScratch;
 
+    // Per-udpReader scratch (64-deep mmsghdr / iovec / sockaddr_in
+    // table + 64 × (10 B virtio_net_hdr + jumbo payload) buffers,
+    // pre-wired). Same lifetime story as TunReaderScratch.
+    struct UdpReaderScratch;
+
     TunReaderScratch* makeTunReaderScratch(stl::ObjPool* pool);
+    UdpReaderScratch* makeUdpReaderScratch(stl::ObjPool* pool);
 
-    // tunReader: read inner IP packets off `tunFd`. Each read carries
-    // a 10-byte virtio_net_hdr prefix; on GSO_TCPV4 we split the
-    // super-packet via gsoSplit and send each segment, on GSO_NONE
-    // we send as-is (after fixing up the L4 checksum if NEEDS_CSUM).
-    // Stripe slot picked from `conns` per packet sent. `scratch`
-    // owns all the working buffers.
-    void tunReader(stl::IoReactor* reactor, int tunFd, ConnTable* conns,
-                   TunReaderScratch* scratch);
+    // tunReader: blocking read(tunFd) loop. Decodes virtio_net_hdr,
+    // splits GSO_TCPV4 super-packets via gsoSplit, sends each segment
+    // through the stripe slot picked from `conns`. Runs on its own
+    // OS thread — no coroutine yield, no io_uring.
+    void tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc);
 
-    // udpReader: recvfrom on `udpFd` and write each datagram into
-    // `tunFd` with a zeroed 10-byte virtio_net_hdr prefix (= no
-    // offload, plain packet). main spawns one of these per
-    // ConnTable::srcFd(i).
-    void udpReader(stl::IoReactor* reactor, int udpFd, int tunFd);
+    // udpReader: blocking recvmmsg(64) loop. For each packet drained
+    // from the UDP socket, write[10-byte zeroed virtio_net_hdr |
+    // payload] to the paired TUN queue.
+    void udpReader(int udpFd, int tunFd, UdpReaderScratch* sc);
 }

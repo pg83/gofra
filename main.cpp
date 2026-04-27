@@ -1,9 +1,13 @@
 // gofra2 — C++ data plane on top of std/.
 //
-// Phase 1 skeleton: single TUN queue, single UDP socket, no
-// virtio_net_hdr / GSO. Validates that std/'s io_uring reactor
-// handles the TUN char device correctly. Phase 2 widens to
-// multi-queue + IFF_VNET_HDR + gsoSplit for parity with gofra1.
+// Plain pthreads, blocking syscalls, no coroutines. Each TUN queue
+// gets a dedicated tunReader thread (read → gsoSplit → per-segment
+// sendto via stripe); each UDP socket gets a dedicated udpReader
+// thread (recvmmsg(64) → write each to the paired TUN queue). N is
+// the local underlay count (== self->dstCount()). This matches Go
+// gofra1's runtime shape and lets us amortize RX syscalls via
+// recvmmsg, which is the main reason gofra1 reaches 3 Gbps where
+// our coroutine + io_uring per-packet variant capped at 1 Gbps.
 
 #include "config.h"
 #include "conn.h"
@@ -13,8 +17,8 @@
 
 #include <std/lib/vector.h>
 #include <std/mem/obj_pool.h>
-#include <std/thr/coro.h>
-#include <std/thr/io_reactor.h>
+#include <std/thr/runable.h>
+#include <std/thr/thread.h>
 #include <std/sys/throw.h>
 #include <std/str/view.h>
 #include <std/ios/sys.h>
@@ -59,7 +63,7 @@ namespace {
         auto* conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self,
                                         cfg->udpRecvBuf, cfg->udpSendBuf);
 
-        // Open N TUN queues (paired with the N UDP sockets by index).
+        // Open N TUN queues paired with the N UDP sockets by index.
         // Iface-level mtu/addr/up runs once after all queues attach.
         size_t n = conns->srcCount();
         Vector<int> tunFds;
@@ -74,34 +78,35 @@ namespace {
              << StringView(u8" peers=") << (u64)conns->size()
              << endL;
 
-        auto exec = CoroExecutor::create(pool.mutPtr(), 8);
-        auto reactor = exec->io();
-
-        // 32 KiB stack: tunReader / udpReader carry a 10 KiB packet buffer
-        // on the coroutine stack and call into io_uring + std/ formatting
-        // helpers, which together can use a few KiB of frame space.
-        constexpr size_t stackSize = 32 * 1024;
-
-        // N tunReader + N udpReader, paired by index. Allocate
-        // per-coroutine GSO scratch up front (single-threaded; pool
-        // isn't thread-safe), then hand pointers to the lambdas.
+        // 2*N OS threads, paired by index. Scratch buffers are
+        // pool-allocated up-front (single-threaded — pool isn't
+        // thread-safe), runables go on the heap with self-delete via
+        // makeRunablePtr so they survive the spawn call.
+        Vector<Thread*> threads;
         for (size_t i = 0; i < n; ++i) {
             int tunFd = tunFds[i];
             int srcFd = conns->srcFd(i);
-            auto* scratch = makeTunReaderScratch(pool.mutPtr());
 
-            exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable(
-                [reactor, tunFd, conns, scratch] {
-                    tunReader(reactor, tunFd, conns, scratch);
-                }));
+            auto* ts = makeTunReaderScratch(pool.mutPtr());
+            auto* us = makeUdpReaderScratch(pool.mutPtr());
 
-            exec->spawnRun(SpawnParams().setStackSize(stackSize).setRunable(
-                [reactor, srcFd, tunFd] {
-                    udpReader(reactor, srcFd, tunFd);
-                }));
+            auto* tr = makeRunablePtr([tunFd, conns, ts] {
+                tunReader(tunFd, conns, ts);
+            });
+            auto* ur = makeRunablePtr([srcFd, tunFd, us] {
+                udpReader(srcFd, tunFd, us);
+            });
+
+            threads.pushBack(Thread::create(pool.mutPtr(), *tr));
+            threads.pushBack(Thread::create(pool.mutPtr(), *ur));
         }
 
-        exec->join();
+        // Park forever — threads loop until process death; SIGINT/
+        // SIGTERM kills us and pid1 reaps the worker threads.
+        for (size_t i = 0; i < threads.length(); ++i) {
+            threads[i]->join();
+        }
+
         return 0;
     }
 }

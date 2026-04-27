@@ -72,7 +72,9 @@ namespace {
 }
 
 int gofra::openUdpSocket(ObjPool* pool, const sockaddr_in* src, int rcvBuf, int sndBuf) {
-    int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    // Blocking socket — udpReader pthreads block on recvmmsg with
+    // MSG_WAITFORONE; non-blocking would just spin EAGAIN.
+    int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"socket(UDP)"));
     }

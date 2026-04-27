@@ -179,6 +179,34 @@ func recvmmsg(fd uintptr, msgs []rawMessage) (int, bool) {
 	return int(n), true
 }
 
+// sendmmsg ships `len(msgs)` pre-built messages in one syscall.
+// Returns (count_accepted, done) where done=false means EAGAIN —
+// caller's rawConn.Write retries after netpoll signals writable.
+// Partial sends (sent < len) with done=true happen when the kernel
+// EAGAINs mid-batch; remaining slots are dropped from gofra's
+// view (UDP, no retransmit; TCP above will recover).
+func sendmmsg(fd uintptr, msgs []rawMessage) (int, bool) {
+	n, _, errno := unix.Syscall6(
+		unix.SYS_SENDMMSG,
+		fd,
+		uintptr(unsafe.Pointer(&msgs[0])),
+		uintptr(len(msgs)),
+		0,
+		0,
+		0,
+	)
+
+	if errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK {
+		return int(n), false
+	}
+
+	if errno != 0 {
+		ThrowFmt("sendmmsg: %v", errno)
+	}
+
+	return int(n), true
+}
+
 // fromV4 extracts (ip, port) from a sockaddr_in laid out at
 // names[i][0:16]. Bytes 0..1 = sa_family, 2..4 = port (big-endian),
 // 4..8 = ipv4 addr.
@@ -188,4 +216,20 @@ func fromV4(name []byte) netip.AddrPort {
 	copy(ip[:], name[4:8])
 
 	return netip.AddrPortFrom(netip.AddrFrom4(ip), port)
+}
+
+// fillSockaddrV4 encodes (ip, port) into the 16 bytes of a
+// sockaddr_in laid out as: family(2 LE) port(2 BE) addr(4) zeros(8).
+// Pre-encoded once per peer dst at registration so the TX hot path
+// doesn't re-derive AF_INET / port bytes on every send.
+func fillSockaddrV4(out []byte, ap netip.AddrPort) {
+	out[0] = unix.AF_INET
+	out[1] = 0
+	binary.BigEndian.PutUint16(out[2:4], ap.Port())
+	a4 := ap.Addr().As4()
+	copy(out[4:8], a4[:])
+
+	for i := 8; i < 16; i++ {
+		out[i] = 0
+	}
 }

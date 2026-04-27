@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,11 +23,17 @@ const (
 // dst endpoints to stripe over, the per-peer RR counter, the
 // per-peer outbound seq counter, and the per-peer reorder pipeline
 // used on the inbound side.
+//
+// dstSockAddrs is the parallel pre-encoded sockaddr_in form of
+// dsts (16 bytes each) so the TX hot path can copy a fixed
+// 16-byte blob into the sendmmsg msghdr name slot without
+// re-deriving AF_INET / port bytes per packet.
 type peer struct {
-	dsts  []netip.AddrPort
-	rr    atomic.Uint64
-	txSeq atomic.Uint32
-	rx    *reorderPipe
+	dsts         []netip.AddrPort
+	dstSockAddrs [][16]byte
+	rr           atomic.Uint64
+	txSeq        atomic.Uint32
+	rx           *reorderPipe
 }
 
 // Gofra is the data plane: N src sockets + peer table + N TUN queues.
@@ -82,9 +89,16 @@ func newGofra(cfg *parsedConfig, logger *slog.Logger) *Gofra {
 			writers[i] = t
 		}
 
+		dstSockAddrs := make([][16]byte, len(dsts))
+
+		for i, d := range dsts {
+			fillSockaddrV4(dstSockAddrs[i][:], d)
+		}
+
 		p := &peer{
-			dsts: dsts,
-			rx:   newReorderPipe(cfg.Timeout, writers, logger),
+			dsts:         dsts,
+			dstSockAddrs: dstSockAddrs,
+			rx:           newReorderPipe(cfg.Timeout, writers, logger),
 		}
 		peers[vip] = p
 
@@ -199,9 +213,70 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 			segBufs[i] = make([]byte, mtu+128)
 		}
 
-		txWire := make([]byte, wireSeqLen+mtu+128)
+		// One sendQueue per src socket. Worst case all maxGSOSegs
+		// segments from one superframe hash to the same src, so
+		// each queue is sized for that.
+		queues := make([]*sendQueue, len(g.socks))
+		rcs := make([]syscall.RawConn, len(g.socks))
 
-		send := g.makeSender(txWire)
+		for i, s := range g.socks {
+			queues[i] = newSendQueue(maxGSOSegs, mtu)
+			rcs[i] = Throw2(s.SyscallConn())
+		}
+
+		queue := func(payload []byte) {
+			if len(payload) < 20 {
+				return
+			}
+
+			dst, ok := dstFromIPv4(payload)
+			if !ok {
+				return
+			}
+
+			p, ok := g.peers[dst]
+			if !ok {
+				return
+			}
+
+			c := p.rr.Add(1) - 1
+			srcIdx := int(c % uint64(len(g.socks)))
+			dstIdx := int((c / uint64(len(g.socks))) % uint64(len(p.dsts)))
+
+			seq := p.txSeq.Add(1) - 1
+
+			queues[srcIdx].push(p.dstSockAddrs[dstIdx], seq, payload)
+		}
+
+		flush := func() {
+			for srcIdx, q := range queues {
+				if q.n == 0 {
+					continue
+				}
+
+				wantN := q.n
+
+				err := rcs[srcIdx].Write(func(fd uintptr) bool {
+					sent, done := sendmmsg(fd, q.msgs[:q.n])
+
+					if !done {
+						return false
+					}
+
+					if sent < q.n {
+						g.logger.Warn("sendmmsg partial", "src", srcIdx, "sent", sent, "total", q.n)
+					}
+
+					return true
+				})
+
+				if err != nil && !errors.Is(err, net.ErrClosed) {
+					g.logger.Warn("sendmmsg control failed", "src", srcIdx, "want", wantN, "err", err)
+				}
+
+				q.n = 0
+			}
+		}
 
 		for {
 			n := Throw2(t.Read(buf))
@@ -225,7 +300,7 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 					}
 				}
 
-				send(pkt)
+				queue(pkt)
 
 			case unix.VIRTIO_NET_HDR_GSO_TCPV4:
 				segs, err := gsoSplit(pkt, hdr, segBufs, segSizes, 0, false)
@@ -236,52 +311,70 @@ func (g *Gofra) tunReader(idx int, t *TUN) *Exception {
 				}
 
 				for i := 0; i < segs; i++ {
-					send(segBufs[i][:segSizes[i]])
+					queue(segBufs[i][:segSizes[i]])
 				}
 
 			default:
 				g.logger.Debug("tun: unsupported gso_type", "type", hdr.gsoType)
 			}
+
+			// One sendmmsg per used src socket per superframe.
+			// All segments queued from this superframe ship in
+			// at most len(g.socks) syscalls instead of one per
+			// segment.
+			flush()
 		}
 	})
 }
 
-// makeSender returns the per-tunReader stripe-and-send closure. It
-// reuses the caller-provided txWire scratch buffer to assemble
-// [seq 4B][payload] in one piece — single WriteToUDPAddrPort, one
-// memcpy of the payload.
-func (g *Gofra) makeSender(txWire []byte) func([]byte) {
-	return func(payload []byte) {
-		if len(payload) < 20 {
-			return
-		}
+// sendQueue is a per-(tunReader, src socket) batched-send buffer.
+// Each slot owns its own scratch payload, iovec, and sockaddr_in
+// storage; the parallel msgs[] array is laid out as the kernel
+// expects for sendmmsg(2). slot wiring (msg.Hdr.Iov, msg.Hdr.Name)
+// is set up once at construction; per-push only updates iov.Len,
+// the address bytes, and the payload contents.
+type sendQueue struct {
+	msgs  []rawMessage
+	iovs  []iovec
+	addrs [][16]byte
+	bufs  [][]byte
+	n     int
+}
 
-		dst, ok := dstFromIPv4(payload)
-		if !ok {
-			return
-		}
-
-		p, ok := g.peers[dst]
-		if !ok {
-			return
-		}
-
-		c := p.rr.Add(1) - 1
-		srcIdx := int(c % uint64(len(g.socks)))
-		dstIdx := int((c / uint64(len(g.socks))) % uint64(len(p.dsts)))
-
-		seq := p.txSeq.Add(1) - 1
-
-		binary.BigEndian.PutUint32(txWire[:wireSeqLen], seq)
-		copy(txWire[wireSeqLen:], payload)
-		wire := txWire[:wireSeqLen+len(payload)]
-
-		if _, err := g.socks[srcIdx].WriteToUDPAddrPort(wire, p.dsts[dstIdx]); err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				g.logger.Warn("udp write failed", "src", srcIdx, "dst", p.dsts[dstIdx], "err", err)
-			}
-		}
+func newSendQueue(maxN, mtu int) *sendQueue {
+	q := &sendQueue{
+		msgs:  make([]rawMessage, maxN),
+		iovs:  make([]iovec, maxN),
+		addrs: make([][16]byte, maxN),
+		bufs:  make([][]byte, maxN),
 	}
+
+	for i := 0; i < maxN; i++ {
+		q.bufs[i] = make([]byte, wireSeqLen+mtu+128)
+
+		q.iovs[i].Base = &q.bufs[i][0]
+		q.msgs[i].Hdr.Iov = &q.iovs[i]
+		q.msgs[i].Hdr.Iovlen = 1
+		q.msgs[i].Hdr.Name = &q.addrs[i][0]
+		q.msgs[i].Hdr.Namelen = 16
+	}
+
+	return q
+}
+
+// push fills the next slot with [seq 4B][payload] and the dst
+// sockaddr_in. Caller is responsible for not exceeding the queue's
+// preallocated size — sized for maxGSOSegs at construction.
+func (q *sendQueue) push(dst [16]byte, seq uint32, payload []byte) {
+	slot := q.n
+
+	binary.BigEndian.PutUint32(q.bufs[slot][:wireSeqLen], seq)
+	copy(q.bufs[slot][wireSeqLen:], payload)
+
+	q.iovs[slot].Len = uint64(wireSeqLen + len(payload))
+	q.addrs[slot] = dst
+
+	q.n++
 }
 
 // udpReader pumps inbound UDP packets through to the reorder

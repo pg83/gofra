@@ -21,15 +21,12 @@ using namespace stl;
 
 namespace {
     // SO_BINDTODEVICE: TX must leave on the NIC owning src, not what routing picks.
-    size_t ifaceFor(u32 addr_ne, char out[IFNAMSIZ]) {
+    StringView ifaceFor(u32 addr_ne, Buffer& buf) {
         ifaddrs* ifs = nullptr;
 
         if (getifaddrs(&ifs) != 0) {
             Errno().raise(StringBuilder() << StringView(u8"getifaddrs"));
         }
-
-        out[0] = 0;
-        size_t outLen = 0;
 
         for (ifaddrs* p = ifs; p; p = p->ifa_next) {
             if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) {
@@ -45,9 +42,7 @@ namespace {
                     name = name.prefix(IFNAMSIZ - 1);
                 }
 
-                memCpy(out, name.data(), name.length());
-                out[name.length()] = 0;
-                outLen = name.length();
+                buf.append(name.data(), name.length());
 
                 break;
             }
@@ -55,17 +50,17 @@ namespace {
 
         freeifaddrs(ifs);
 
-        if (!outLen) {
-            char buf[INET_ADDRSTRLEN] = {0};
+        if (buf.empty()) {
+            char tmp[INET_ADDRSTRLEN] = {0};
 
-            inet_ntop(AF_INET, &addr_ne, buf, sizeof(buf));
+            inet_ntop(AF_INET, &addr_ne, tmp, sizeof(tmp));
 
             Errno(0).raise(StringBuilder()
                            << StringView(u8"no iface owns ")
-                           << StringView(buf));
+                           << StringView(tmp));
         }
 
-        return outLen;
+        return StringView(buf);
     }
 
     void setBufForce(int fd, int opt, int sz, StringView name) {
@@ -86,12 +81,11 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int snd
 
     auto* sin = (const sockaddr_in*)src;
 
-    char ifname[IFNAMSIZ];
+    Buffer ifname;
+    StringView name = ifaceFor(sin->sin_addr.s_addr, ifname);
 
-    size_t ifnameLen = ifaceFor(sin->sin_addr.s_addr, ifname);
-
-    if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, ifnameLen) < 0) {
-        Errno().raise(StringBuilder() << StringView(u8"SO_BINDTODEVICE ") << StringView(ifname));
+    if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, name.data(), name.length()) < 0) {
+        Errno().raise(StringBuilder() << StringView(u8"SO_BINDTODEVICE ") << name);
     }
 
     setBufForce(fd, SO_RCVBUFFORCE, rcvBuf, StringView(u8"SO_RCVBUFFORCE"));

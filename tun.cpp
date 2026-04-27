@@ -91,19 +91,20 @@ namespace {
         void linkUp(int idx);
     };
 
-    // Configure addr/mtu/up via rtnetlink. Mirrors what gofra1's
-    // vishvananda/netlink does — proper NEWADDR with all the right
-    // attrs (IFA_LOCAL, IFA_ADDRESS, IFA_BROADCAST, prefixlen, scope).
-    // The legacy SIOCSIF* ioctl path silently drops egress on a /24
-    // P2P TUN even though the route table looks right.
-    void configure(const char* dev, int mtu, u32 vip, u8 prefixLen) {
-        int idx = ifIndexFor(dev);
+}
 
-        Netlink nl;
-        nl.setMtu(idx, mtu);
-        nl.addAddr(idx, vip, prefixLen);
-        nl.linkUp(idx);
-    }
+// Iface-level config via rtnetlink. Mirrors what gofra1's
+// vishvananda/netlink does — proper NEWADDR with all the right
+// attrs (IFA_LOCAL, IFA_ADDRESS, IFA_BROADCAST, prefixlen, scope).
+// The legacy SIOCSIF* ioctl path silently drops egress on a /24
+// P2P TUN even though the route table looks right.
+void gofra::configureTun(const char* dev, int mtu, u32 vip, u8 prefixLen) {
+    int idx = ifIndexFor(dev);
+
+    Netlink nl;
+    nl.setMtu(idx, mtu);
+    nl.addAddr(idx, vip, prefixLen);
+    nl.linkUp(idx);
 }
 
 Netlink::Netlink() {
@@ -207,7 +208,7 @@ void Netlink::linkUp(int idx) {
     run(nh, StringView(u8"RTM_NEWLINK UP"));
 }
 
-int gofra::openTun(ObjPool* pool, const char* dev, int mtu, u32 vip, u8 prefixLen) {
+int gofra::openTun(ObjPool* pool, const char* dev) {
     int fd = ::open("/dev/net/tun", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         Errno().raise(StringBuilder() << StringView(u8"open /dev/net/tun"));
@@ -218,14 +219,12 @@ int gofra::openTun(ObjPool* pool, const char* dev, int mtu, u32 vip, u8 prefixLe
     pool->make<ScopedFD>(fd);
 
     ifreq ifr = {};
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
     copyIfName(ifr.ifr_name, StringView(dev));
 
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"TUNSETIFF ") << StringView(dev));
     }
-
-    configure(dev, mtu, vip, prefixLen);
 
     return fd;
 }

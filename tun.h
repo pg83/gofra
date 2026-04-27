@@ -7,14 +7,18 @@ namespace stl {
 }
 
 namespace gofra {
-    // openTun opens /dev/net/tun, names the device, sets MTU, assigns
-    // the inner IPv4 / prefix, and brings the link up. The fd is
-    // registered in `pool` for ::close on pool destruction; the
-    // returned int is the live fd for the caller to use.
+    // openTun opens one TUN queue on `dev` with IFF_MULTI_QUEUE and
+    // returns its fd (pool-registered via stl::ScopedFD). Call N
+    // times to attach N parallel queues to the same device, then
+    // call configureTun once — the iface-level mtu/addr/up doesn't
+    // care which fd opened it.
     //
-    // Phase 1: single queue, no IFF_VNET_HDR. Carries plain inner IP
-    // packets at MTU; no kernel-side TSO/GSO. Phase 2 will add multi-
-    // queue + virtio_net_hdr + TUNSETOFFLOAD for parity with the Go
-    // gofra1 perf profile.
-    int openTun(stl::ObjPool* pool, const char* dev, int mtu, u32 vip, u8 prefixLen);
+    // Phase 1: no IFF_VNET_HDR / GSO / TSO — plain inner IP packets
+    // at MTU. Phase 2 will add the virtio_net_hdr offload path.
+    int openTun(stl::ObjPool* pool, const char* dev);
+
+    // configureTun runs the iface-level netlink config: set MTU,
+    // assign vip/prefixLen, bring the link up. Call exactly once
+    // after openTun has attached all queues.
+    void configureTun(const char* dev, int mtu, u32 vip, u8 prefixLen);
 }

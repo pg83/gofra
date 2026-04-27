@@ -29,38 +29,24 @@ namespace {
     };
 
     // SO_BINDTODEVICE: TX must leave on the NIC owning src, not what routing picks.
-    StringView ifaceFor(ObjPool* pool, u32 addr_ne) {
+    StringView ifaceFor(ObjPool* pool, const sockaddr* src) {
         auto* holder = pool->make<IfAddrs>();
 
         if (getifaddrs(&holder->ifs) != 0) {
             Errno().raise(StringBuilder() << StringView(u8"getifaddrs"));
         }
 
-        for (ifaddrs* p = holder->ifs; p; p = p->ifa_next) {
-            if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) {
-                continue;
-            }
+        u32 want = ((const sockaddr_in*)src)->sin_addr.s_addr;
 
-            sockaddr_in* sa = (sockaddr_in*)p->ifa_addr;
+        for (auto* p = holder->ifs; p; p = p->ifa_next) {
+            auto* a = (sockaddr_in*)p->ifa_addr;
 
-            if (sa->sin_addr.s_addr == addr_ne) {
-                StringView name(p->ifa_name);
-
-                if (name.length() >= IFNAMSIZ) {
-                    name = name.prefix(IFNAMSIZ - 1);
-                }
-
-                return name;
+            if (a && a->sin_family == AF_INET && a->sin_addr.s_addr == want) {
+                return StringView(p->ifa_name).prefix(IFNAMSIZ - 1);
             }
         }
 
-        char tmp[INET_ADDRSTRLEN] = {0};
-
-        inet_ntop(AF_INET, &addr_ne, tmp, sizeof(tmp));
-
-        Errno(0).raise(StringBuilder()
-                       << StringView(u8"no iface owns ")
-                       << StringView(tmp));
+        Errno(0).raise(StringBuilder() << StringView(u8"no iface owns src"));
     }
 
     void setBufForce(int fd, int opt, int sz, StringView name) {
@@ -79,9 +65,7 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int snd
 
     pool->make<ScopedFD>(fd);
 
-    auto* sin = (const sockaddr_in*)src;
-
-    StringView name = ifaceFor(pool, sin->sin_addr.s_addr);
+    StringView name = ifaceFor(pool, src);
 
     if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, name.data(), name.length()) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"SO_BINDTODEVICE ") << name);
@@ -97,6 +81,7 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int snd
     }
 
     if (::bind(fd, src, addrLen(src)) < 0) {
+        auto* sin = (const sockaddr_in*)src;
         char buf[INET_ADDRSTRLEN] = {0};
 
         inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));

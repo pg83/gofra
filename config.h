@@ -22,6 +22,8 @@ namespace gofra {
 
         int udpRecvBuf;
         int udpSendBuf;
+
+        const char* user;
     };
 
     Config* loadConfig(stl::ObjPool* pool, stl::StringView path);

@@ -4,16 +4,21 @@
 #include "plane.h"
 #include "tun.h"
 
+#include <std/lib/buffer.h>
 #include <std/lib/vector.h>
 #include <std/mem/obj_pool.h>
 #include <std/thr/runable.h>
 #include <std/thr/thread.h>
 #include <std/sys/throw.h>
 #include <std/str/view.h>
+#include <std/str/builder.h>
 #include <std/ios/sys.h>
 
+#include <pwd.h>
+#include <grp.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <unistd.h>
 
 using namespace stl;
 using namespace gofra;
@@ -22,6 +27,26 @@ namespace {
     [[noreturn]] void usage() {
         sysE << StringView(u8"usage: gofra --config /path/to/config.ini") << endL << flsH;
         exit(2);
+    }
+
+    void dropPrivs(const char* user) {
+        auto* pw = getpwnam(user);
+
+        if (!pw) {
+            Errno(0).raise(StringBuilder() << StringView(u8"unknown user: ") << StringView(user));
+        }
+
+        if (setgroups(0, nullptr) != 0) {
+            Errno().raise(StringBuilder() << StringView(u8"setgroups"));
+        }
+
+        if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) != 0) {
+            Errno().raise(StringBuilder() << StringView(u8"setresgid"));
+        }
+
+        if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) != 0) {
+            Errno().raise(StringBuilder() << StringView(u8"setresuid"));
+        }
     }
 
     void run(int argc, char** argv) {
@@ -55,6 +80,10 @@ namespace {
         }
 
         configureTun(cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
+
+        if (cfg->user) {
+            dropPrivs(cfg->user);
+        }
 
         sysE << StringView(u8"gofra: tun=") << StringView(cfg->tunDev)
              << StringView(u8" mtu=") << (u64)cfg->tunMtu

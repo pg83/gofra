@@ -62,6 +62,7 @@ cat > "$TMP/local.ini" <<EOF
 vip     = $LOCAL_VIP/24
 tun_dev = $TUN
 tun_mtu = 1280
+user    = nobody
 
 $PEERS_BLOCK
 
@@ -75,6 +76,7 @@ cat > "$TMP/lab.ini" <<EOF
 vip     = $LAB_VIP/24
 tun_dev = $TUN
 tun_mtu = 1280
+user    = nobody
 
 $PEERS_BLOCK
 

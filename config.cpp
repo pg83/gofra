@@ -66,6 +66,10 @@ namespace {
         if (auto* v = sec->map.find(StringView(u8"tun_mtu")); v) {
             cfg->tunMtu = (int)v->stou();
         }
+
+        if (auto* v = sec->map.find(StringView(u8"user")); v) {
+            cfg->user = internCStr(pool, *v);
+        }
     }
 
     void loadUdp(Config* cfg, ini::Section* sec) {
@@ -103,6 +107,7 @@ Config* gofra::loadConfig(ObjPool* pool, StringView path) {
     cfg->self = nullptr;
     cfg->udpRecvBuf = 16 << 20;
     cfg->udpSendBuf = 16 << 20;
+    cfg->user = nullptr;
 
     Buffer pathBuf;
     pathBuf.append(path.data(), path.length());

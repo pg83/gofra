@@ -118,13 +118,14 @@ namespace {
 
         u64 probeIntervalMs = cfg->probeIntervalMs;
         u64 probeTimeoutMs = cfg->probeTimeoutMs;
+        u64 statsIntervalSec = cfg->statsIntervalSec;
 
         auto* pr = makeRunablePtr([conns, probeIntervalMs] {
             prober(conns, probeIntervalMs);
         });
 
-        auto* st = makeRunablePtr([conns, probeTimeoutMs] {
-            slotsStats(conns, probeTimeoutMs);
+        auto* st = makeRunablePtr([conns, probeTimeoutMs, statsIntervalSec] {
+            slotsStats(conns, probeTimeoutMs, statsIntervalSec);
         });
 
         threads.pushBack(Thread::create(pool.mutPtr(), *pr));

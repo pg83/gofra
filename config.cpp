@@ -90,6 +90,10 @@ namespace {
         if (auto* v = sec->map.find(StringView(u8"timeout_ms")); v) {
             cfg->probeTimeoutMs = v->stou();
         }
+
+        if (auto* v = sec->map.find(StringView(u8"stats_interval_s")); v) {
+            cfg->statsIntervalSec = v->stou();
+        }
     }
 }
 
@@ -119,6 +123,7 @@ Config* gofra::loadConfig(ObjPool* pool, StringView path) {
     cfg->udpSendBuf = 16 << 20;
     cfg->probeIntervalMs = 200;
     cfg->probeTimeoutMs = 1000;
+    cfg->statsIntervalSec = 10;
     cfg->user = nullptr;
 
     Buffer pathBuf;

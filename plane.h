@@ -24,7 +24,7 @@ namespace gofra {
     // the loop.
     void prober(ConnTable* conns, u64 intervalMs);
 
-    // Once a second, log a one-line snapshot of every slot's
+    // Every intervalSec, log a one-line snapshot of every slot's
     // (src,dst,alive) on stderr.
-    void slotsStats(ConnTable* conns, u64 timeoutMs);
+    void slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec);
 }

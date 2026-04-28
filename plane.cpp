@@ -277,7 +277,7 @@ void gofra::prober(ConnTable* conns, u64 intervalMs) {
     }
 }
 
-void gofra::slotsStats(ConnTable* conns, u64 timeoutMs) {
+void gofra::slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec) {
     Vector<ConnSlot*> slots;
     conns->visitSlots([&slots](ConnSlot* s) {
         slots.pushBack(s);
@@ -304,6 +304,6 @@ void gofra::slotsStats(ConnTable* conns, u64 timeoutMs) {
         }
 
         sysE << StringView(sb) << endL;
-        sleep(1);
+        sleep((unsigned)intervalSec);
     }
 }

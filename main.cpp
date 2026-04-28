@@ -45,11 +45,9 @@ namespace {
 
         auto pool = ObjPool::fromMemory();
         auto cfg = loadConfig(pool.mutPtr(), configPath);
-
-        auto* conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self,
-                                        cfg->udpRecvBuf, cfg->udpSendBuf);
-
+        auto conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self, cfg->udpRecvBuf, cfg->udpSendBuf);
         size_t n = conns->srcCount();
+
         Vector<int> tunFds;
 
         for (size_t i = 0; i < n; ++i) {
@@ -66,6 +64,7 @@ namespace {
 
         // Pool isn't thread-safe → pre-alloc scratch on this thread.
         Vector<Thread*> threads;
+
         for (size_t i = 0; i < n; ++i) {
             int tunFd = tunFds[i];
             int srcFd = conns->srcFd(i);

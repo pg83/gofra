@@ -23,6 +23,9 @@ namespace gofra {
         int udpRecvBuf;
         int udpSendBuf;
 
+        u64 probeIntervalMs;
+        u64 probeTimeoutMs;
+
         const char* user;
     };
 

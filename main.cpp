@@ -70,7 +70,9 @@ namespace {
 
         auto pool = ObjPool::fromMemory();
         auto cfg = loadConfig(pool.mutPtr(), configPath);
-        auto conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self, cfg->udpRecvBuf, cfg->udpSendBuf);
+        auto conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self,
+                                       cfg->udpRecvBuf, cfg->udpSendBuf,
+                                       cfg->probeTimeoutMs);
         size_t n = conns->srcCount();
 
         Vector<int> tunFds;
@@ -97,6 +99,7 @@ namespace {
         for (size_t i = 0; i < n; ++i) {
             int tunFd = tunFds[i];
             int srcFd = conns->srcFd(i);
+            u32 srcIdx = (u32)i;
 
             auto* ts = makeTunReaderScratch(pool.mutPtr());
             auto* us = makeUdpReaderScratch(pool.mutPtr());
@@ -105,13 +108,20 @@ namespace {
                 tunReader(tunFd, conns, ts);
             });
 
-            auto* ur = makeRunablePtr([srcFd, tunFd, us] {
-                udpReader(srcFd, tunFd, us);
+            auto* ur = makeRunablePtr([srcFd, tunFd, srcIdx, conns, us] {
+                udpReader(srcFd, tunFd, srcIdx, conns, us);
             });
 
             threads.pushBack(Thread::create(pool.mutPtr(), *tr));
             threads.pushBack(Thread::create(pool.mutPtr(), *ur));
         }
+
+        u64 probeIntervalMs = cfg->probeIntervalMs;
+        auto* pr = makeRunablePtr([conns, probeIntervalMs] {
+            prober(conns, probeIntervalMs);
+        });
+
+        threads.pushBack(Thread::create(pool.mutPtr(), *pr));
 
         for (size_t i = 0; i < threads.length(); ++i) {
             threads[i]->join();

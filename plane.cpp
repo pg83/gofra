@@ -4,11 +4,14 @@
 #include "gso.h"
 #include "peer.h"
 
+#include <std/lib/vector.h>
 #include <std/mem/obj_pool.h>
+#include <std/sys/atomic.h>
 #include <std/sys/crt.h>
 #include <std/str/view.h>
 #include <std/ios/sys.h>
 
+#include <time.h>
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
@@ -70,6 +73,12 @@ struct gofra::UdpReaderScratch {
 };
 
 namespace {
+    u64 nowMs() noexcept {
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
+    }
+
     void warnErrno(StringView what, int err) {
         sysE << StringView(u8"gofra: ") << what
              << StringView(u8": ")
@@ -82,7 +91,7 @@ namespace {
     }
 
     void sendOne(Conn* conn, const u8* pkt, size_t len) {
-        auto slot = conn->next();
+        auto slot = conn->next(nowMs());
 
         ssize_t r = ::sendto(slot->srcFd, pkt, len, 0,
                              slot->dstAddr, addrLen(slot->dstAddr));
@@ -98,6 +107,7 @@ namespace {
     void sendUso(Conn* conn, TunReaderScratch* sc, int segs) {
         int partSize = (segs + USO_PARTS - 1) / USO_PARTS;
         u16 gsoSize = (u16)sc->segSizes[0];
+        u64 now = nowMs();
 
         int i = 0;
 
@@ -113,7 +123,7 @@ namespace {
                 sc->iovs[k].iov_len  = sc->segSizes[k];
             }
 
-            auto* slot = conn->next();
+            auto* slot = conn->next(now);
 
             msghdr msg = {};
             msg.msg_name    = (void*)slot->dstAddr;
@@ -204,7 +214,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
     }
 }
 
-void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
+void gofra::udpReader(int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpReaderScratch* sc) {
     for (;;) {
         int n = ::recvmmsg(udpFd, sc->msgs, UdpReaderScratch::BATCH, MSG_WAITFORONE, nullptr);
 
@@ -213,15 +223,25 @@ void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
             continue;
         }
 
+        u64 now = nowMs();
+
         for (int i = 0; i < n; ++i) {
             u32 payloadLen = sc->msgs[i].msg_len;
 
-            if (payloadLen < 20) {
-                continue;
+            // Any incoming packet (probe or data) is liveness evidence
+            // for the (our_src_idx, peer_src_addr) slot.
+            if (auto* slot = conns->lookupSlot(srcIdx, sc->addrs[i])) {
+                stdAtomicStore(&slot->lastSeen, now, MemoryOrder::Relaxed);
             }
 
             // recvmmsg shrunk namelen to the actual sender; reset.
             sc->msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
+
+            // Probe packets carry < 20 B payload; the liveness bump
+            // above is the whole point — don't forward to TUN.
+            if (payloadLen < 20) {
+                continue;
+            }
 
             ssize_t w = ::write(tunFd, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen);
 
@@ -229,5 +249,28 @@ void gofra::udpReader(int udpFd, int tunFd, UdpReaderScratch* sc) {
                 warnErrno(StringView(u8"tun write"), errno);
             }
         }
+    }
+}
+
+void gofra::prober(ConnTable* conns, u64 intervalMs) {
+    Vector<ConnSlot*> slots;
+    conns->visitSlots([&slots](ConnSlot* s) {
+        slots.pushBack(s);
+    });
+
+    for (;;) {
+        for (size_t i = 0; i < slots.length(); ++i) {
+            auto* slot = slots[i];
+            u8 dummy = 0;
+
+            ssize_t r = ::sendto(slot->srcFd, &dummy, 0, 0,
+                                 slot->dstAddr, addrLen(slot->dstAddr));
+
+            if (r < 0) {
+                warnErrno(StringView(u8"probe sendto"), errno);
+            }
+        }
+
+        usleep((useconds_t)(intervalMs * 1000));
     }
 }

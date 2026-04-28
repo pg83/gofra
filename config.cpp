@@ -81,6 +81,16 @@ namespace {
             cfg->udpSendBuf = (int)v->stou();
         }
     }
+
+    void loadProbe(Config* cfg, ini::Section* sec) {
+        if (auto* v = sec->map.find(StringView(u8"interval_ms")); v) {
+            cfg->probeIntervalMs = v->stou();
+        }
+
+        if (auto* v = sec->map.find(StringView(u8"timeout_ms")); v) {
+            cfg->probeTimeoutMs = v->stou();
+        }
+    }
 }
 
 StringView ConfigError::description() {
@@ -107,6 +117,8 @@ Config* gofra::loadConfig(ObjPool* pool, StringView path) {
     cfg->self = nullptr;
     cfg->udpRecvBuf = 16 << 20;
     cfg->udpSendBuf = 16 << 20;
+    cfg->probeIntervalMs = 200;
+    cfg->probeTimeoutMs = 1000;
     cfg->user = nullptr;
 
     Buffer pathBuf;
@@ -136,6 +148,10 @@ Config* gofra::loadConfig(ObjPool* pool, StringView path) {
 
     if (auto* sec = ini->find(StringView(u8"udp")); sec) {
         loadUdp(cfg, sec);
+    }
+
+    if (auto* sec = ini->find(StringView(u8"probe")); sec) {
+        loadProbe(cfg, sec);
     }
 
     return cfg;

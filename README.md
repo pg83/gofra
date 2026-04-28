@@ -65,7 +65,7 @@ send_buf = 16777216
 ## Run
 
 ```sh
-gofra2 --config /etc/gofra2/config.ini
+gofra --config /etc/gofra/config.ini
 ```
 
 Needs `CAP_NET_ADMIN` (TUN + rtnetlink) and `CAP_NET_RAW`

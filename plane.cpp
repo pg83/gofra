@@ -71,14 +71,14 @@ struct gofra::UdpReaderScratch {
 
 namespace {
     void warnErrno(StringView what, int err) {
-        sysE << StringView(u8"gofra2: ") << what
+        sysE << StringView(u8"gofra: ") << what
              << StringView(u8": ")
              << (const char*)strerror(err)
              << endL;
     }
 
     void warn(StringView msg) {
-        sysE << StringView(u8"gofra2: ") << msg << endL;
+        sysE << StringView(u8"gofra: ") << msg << endL;
     }
 
     void sendOne(Conn* conn, const u8* pkt, size_t len) {

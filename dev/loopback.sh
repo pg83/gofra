@@ -5,18 +5,18 @@
 # (one local src) and 4×1 from lab2 (four local srcs, one remote).
 #
 # No netns, no veth — direct UDP over Ethernet. ssh stays over
-# nebula; only the gofra2 underlay traffic uses eth. No manual
+# nebula; only the gofra underlay traffic uses eth. No manual
 # cleanup either: subreaper kills our children on exit, ssh
-# disconnect SIGHUPs the remote gofra2, and the TUN device is
+# disconnect SIGHUPs the remote gofra, and the TUN device is
 # non-persistent so it disappears with the process. Lab2 side
-# files land in $HOME/gofra2-smoke/ (no /tmp on stalix).
+# files land in $HOME/gofra-smoke/ (no /tmp on stalix).
 #
 # Layout:
 #   local: vip 192.168.110.1/24, underlay 10.0.0.163:$PORT
 #   lab2:  vip 192.168.110.2/24, underlays 10.0.0.{68,69,70,71}:$PORT
 #
 # Custom port and TUN name so we don't stomp on the deployed
-# cluster gofra2.
+# cluster gofra.
 #
 # Usage:
 #   sudo subreaper sh dev/loopback.sh             # 10s TCP
@@ -27,19 +27,19 @@ set -xu
 
 export PATH=/ix/realm/llm/bin:$PATH
 
-GOFRA2=${GOFRA2:-./gofra2}
+GOFRA=${GOFRA:-./gofra}
 LAB_SSH=lab2.nebula              # ssh over nebula; underlay traffic uses eth
 LOCAL_UNDERLAY=10.0.0.163        # this dev machine's eth1 IP
 PORT=8060
-TUN=gofra2_smoke
+TUN=gofra_smoke
 LOCAL_VIP=192.168.110.1
 LAB_VIP=192.168.110.2
 
 # Local scratch (real /tmp here). Lab side lands in $HOME (no /tmp
 # on stalix); SSH_DIR is referenced as a path RELATIVE to whatever
 # pwd ssh lands in.
-TMP=/tmp/gofra2-smoke
-SSH_DIR=gofra2-smoke
+TMP=/tmp/gofra-smoke
+SSH_DIR=gofra-smoke
 
 mode=${1:-tcp}
 secs=${2:-10}
@@ -88,19 +88,19 @@ SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/de
 echo "=== underlay: local=$LOCAL_UNDERLAY  lab=10.0.0.{68,69,70,71} ==="
 
 ssh $SSH_OPTS "root@$LAB_SSH" "mkdir -p $SSH_DIR"
-ssh $SSH_OPTS "root@$LAB_SSH" "cat > $SSH_DIR/gofra2 && chmod +x $SSH_DIR/gofra2" < "$GOFRA2"
+ssh $SSH_OPTS "root@$LAB_SSH" "cat > $SSH_DIR/gofra && chmod +x $SSH_DIR/gofra" < "$GOFRA"
 ssh $SSH_OPTS "root@$LAB_SSH" "cat > $SSH_DIR/lab.ini" < "$TMP/lab.ini"
 
-# Lab gofra2 over a held-open ssh; channel close → SIGHUP → exit.
+# Lab gofra over a held-open ssh; channel close → SIGHUP → exit.
 # `-T` (no pty) keeps startup log lines from sitting in a pipe
-# block buffer; otherwise the initial "gofra2: tun=..." line takes
+# block buffer; otherwise the initial "gofra: tun=..." line takes
 # ages to surface and looks like a hang.
 ssh $SSH_OPTS -T "root@$LAB_SSH" \
-    "exec $SSH_DIR/gofra2 --config $SSH_DIR/lab.ini 2>&1" \
+    "exec $SSH_DIR/gofra --config $SSH_DIR/lab.ini 2>&1" \
     | sed -u 's/^/[lab] /' &
 
-# Local gofra2.
-"$GOFRA2" --config "$TMP/local.ini" &
+# Local gofra.
+"$GOFRA" --config "$TMP/local.ini" &
 
 sleep 1
 
@@ -150,5 +150,5 @@ case "$mode" in
 esac
 
 echo
-echo "=== gofra2 still running. Ctrl-C to stop. ==="
+echo "=== gofra still running. Ctrl-C to stop. ==="
 wait

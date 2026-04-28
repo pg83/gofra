@@ -124,16 +124,16 @@ prefix and the kernel sees a normal packet.
 * Linux only (TUN, SO_BINDTODEVICE, rtnetlink, recvmmsg).
 * Needs root or `CAP_NET_ADMIN + CAP_NET_RAW`.
 * Underlay IPs in `[peers][my_vip]` must already exist on local NICs
-  (gofra2 doesn't add them).
+  (gofra doesn't add them).
 * Switch must forward L2 between every peer's underlay IPs in a
   single broadcast domain (no routed underlay).
 
 ## Dev workflow
 
 ```sh
-make -j               # builds gofra2 against ../std/std/libstd.a
+make -j               # builds gofra against ../std/std/libstd.a
 sudo subreaper sh dev/loopback.sh tcp 30   # 30 s TCP smoke over the local→lab2 stripe
-sudo sh dev/perf.sh 30                     # perf record on the deployed cluster gofra2
+sudo sh dev/perf.sh 30                     # perf record on the deployed cluster gofra
 ```
 
 ## What's deliberately out of scope

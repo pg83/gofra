@@ -20,7 +20,7 @@ using namespace gofra;
 
 namespace {
     [[noreturn]] void usage() {
-        sysE << StringView(u8"usage: gofra2 --config /path/to/config.ini") << endL << flsH;
+        sysE << StringView(u8"usage: gofra --config /path/to/config.ini") << endL << flsH;
         exit(2);
     }
 
@@ -56,7 +56,7 @@ namespace {
 
         configureTun(cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
 
-        sysE << StringView(u8"gofra2: tun=") << StringView(cfg->tunDev)
+        sysE << StringView(u8"gofra: tun=") << StringView(cfg->tunDev)
              << StringView(u8" mtu=") << (u64)cfg->tunMtu
              << StringView(u8" queues=") << (u64)n
              << StringView(u8" peers=") << (u64)conns->size()
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     } catch (Exception& e) {
         sysE << e.description() << endL << flsH;
     } catch (...) {
-        sysE << StringView(u8"gofra2: unknown exception") << endL << flsH;
+        sysE << StringView(u8"gofra: unknown exception") << endL << flsH;
     }
 
     return 1;

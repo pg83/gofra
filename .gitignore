@@ -1,4 +1,4 @@
-/gofra2
+/gofra
 *.pzd
 *.o
 /perf-*.data

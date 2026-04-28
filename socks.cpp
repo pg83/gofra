@@ -14,6 +14,7 @@
 #include <ifaddrs.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 
 using namespace stl;
 
@@ -78,6 +79,10 @@ int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int snd
 
     if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
         Errno().raise(StringBuilder() << StringView(u8"SO_REUSEADDR"));
+    }
+
+    if (::setsockopt(fd, SOL_UDP, UDP_GRO, &yes, sizeof(yes)) < 0) {
+        Errno().raise(StringBuilder() << StringView(u8"UDP_GRO"));
     }
 
     if (::bind(fd, src, addrLen(src)) < 0) {

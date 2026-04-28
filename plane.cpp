@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/uio.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -43,15 +44,22 @@ struct gofra::TunReaderScratch {
     }
 };
 
-// bufs[i] = [10 B zero virtio_net_hdr | payload]; recvmmsg fills only payload (iov_base=buf+10).
+// bufs[i] = [10 B zero virtio_net_hdr | payload]; recvmmsg fills
+// only payload (iov_base=buf+10). With UDP_GRO the kernel coalesces
+// multiple datagrams from the same UDP flow into one buffer, hence
+// the generous MSG_SIZE; the per-msg cbuf catches the UDP_GRO cmsg
+// telling us each original datagram's size.
 struct gofra::UdpReaderScratch {
     static constexpr size_t BATCH    = 64;
-    static constexpr size_t MSG_SIZE = 10 + 9000;
+    static constexpr size_t MSG_SIZE = 10 + 65536;
+    static constexpr size_t CBUF_LEN = CMSG_SPACE(sizeof(int));
 
     mmsghdr msgs[BATCH];
     iovec iovs[BATCH];
     sockaddr* addrs[BATCH];
+    char cbufs[BATCH][CBUF_LEN];
     u8 bufs[BATCH][MSG_SIZE];
+    u8 zeroHdr[VIRTIO_NET_HDR_LEN] = {};
 
     explicit UdpReaderScratch(ObjPool* pool) noexcept {
         for (size_t i = 0; i < BATCH; ++i) {
@@ -66,8 +74,8 @@ struct gofra::UdpReaderScratch {
             msgs[i].msg_hdr.msg_iovlen  = 1;
             msgs[i].msg_hdr.msg_name    = addrs[i];
             msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
-            msgs[i].msg_hdr.msg_control = nullptr;
-            msgs[i].msg_hdr.msg_controllen = 0;
+            msgs[i].msg_hdr.msg_control = cbufs[i];
+            msgs[i].msg_hdr.msg_controllen = CBUF_LEN;
             msgs[i].msg_hdr.msg_flags   = 0;
             msgs[i].msg_len             = 0;
         }
@@ -229,6 +237,7 @@ void gofra::udpReader(int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpRea
 
         for (int i = 0; i < n; ++i) {
             u32 payloadLen = sc->msgs[i].msg_len;
+            msghdr* mh = &sc->msgs[i].msg_hdr;
 
             // Any incoming packet (probe or data) is liveness evidence
             // for the (our_src_idx, peer_src_addr) slot.
@@ -236,19 +245,55 @@ void gofra::udpReader(int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpRea
                 stdAtomicStore(&slot->lastSeen, now, MemoryOrder::Relaxed);
             }
 
-            // recvmmsg shrunk namelen to the actual sender; reset.
-            sc->msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
+            int gsoSize = 0;
 
-            // Probe packets carry < 20 B payload; the liveness bump
-            // above is the whole point — don't forward to TUN.
+            for (cmsghdr* cm = CMSG_FIRSTHDR(mh); cm; cm = CMSG_NXTHDR(mh, cm)) {
+                if (cm->cmsg_level == SOL_UDP && cm->cmsg_type == UDP_GRO) {
+                    memCpy(&gsoSize, CMSG_DATA(cm), sizeof(gsoSize));
+                    break;
+                }
+            }
+
+            // recvmmsg shrunk namelen / controllen; reset for next round.
+            mh->msg_namelen = sizeof(sockaddr_storage);
+            mh->msg_controllen = UdpReaderScratch::CBUF_LEN;
+
             if (payloadLen < 20) {
                 continue;
             }
 
-            ssize_t w = ::write(tunFd, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen);
+            if (gsoSize > 0 && (u32)gsoSize < payloadLen) {
+                // Coalesced super-buffer: split back into per-datagram
+                // writes. virtio_net_hdr is a separate iov so we don't
+                // mutate bufs[i]'s payload.
+                u32 off = 0;
 
-            if (w < 0) {
-                warnErrno(StringView(u8"tun write"), errno);
+                while (off < payloadLen) {
+                    u32 chunk = (u32)gsoSize;
+
+                    if (chunk > payloadLen - off) {
+                        chunk = payloadLen - off;
+                    }
+
+                    iovec iov[2] = {
+                        { sc->zeroHdr, VIRTIO_NET_HDR_LEN },
+                        { sc->bufs[i] + VIRTIO_NET_HDR_LEN + off, chunk },
+                    };
+
+                    ssize_t w = ::writev(tunFd, iov, 2);
+
+                    if (w < 0) {
+                        warnErrno(StringView(u8"tun writev"), errno);
+                    }
+
+                    off += chunk;
+                }
+            } else {
+                ssize_t w = ::write(tunFd, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen);
+
+                if (w < 0) {
+                    warnErrno(StringView(u8"tun write"), errno);
+                }
             }
         }
     }

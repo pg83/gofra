@@ -9,6 +9,7 @@
 #include <std/sys/atomic.h>
 #include <std/sys/crt.h>
 #include <std/str/view.h>
+#include <std/str/builder.h>
 #include <std/ios/sys.h>
 
 #include <time.h>
@@ -16,6 +17,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/udp.h>
@@ -272,5 +274,36 @@ void gofra::prober(ConnTable* conns, u64 intervalMs) {
         }
 
         usleep((useconds_t)(intervalMs * 1000));
+    }
+}
+
+void gofra::slotsStats(ConnTable* conns, u64 timeoutMs) {
+    Vector<ConnSlot*> slots;
+    conns->visitSlots([&slots](ConnSlot* s) {
+        slots.pushBack(s);
+    });
+
+    for (;;) {
+        u64 now = nowMs();
+        StringBuilder sb;
+
+        sb << StringView(u8"gofra slots:");
+
+        for (size_t i = 0; i < slots.length(); ++i) {
+            auto* slot = slots[i];
+            u64 ls = stdAtomicFetch(&slot->lastSeen, MemoryOrder::Relaxed);
+            u64 alive = (now - ls <= timeoutMs) ? 1 : 0;
+
+            char src[INET_ADDRSTRLEN];
+            char dst[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &((const sockaddr_in*)slot->srcAddr)->sin_addr, src, sizeof(src));
+            inet_ntop(AF_INET, &((const sockaddr_in*)slot->dstAddr)->sin_addr, dst, sizeof(dst));
+
+            sb << StringView(u8" [") << StringView(src) << StringView(u8",")
+               << StringView(dst) << StringView(u8",") << alive << StringView(u8"]");
+        }
+
+        sysE << StringView(sb) << endL;
+        sleep(1);
     }
 }

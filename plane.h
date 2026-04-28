@@ -23,4 +23,8 @@ namespace gofra {
     // (RX path treats payloadLen<20 as a probe). intervalMs throttles
     // the loop.
     void prober(ConnTable* conns, u64 intervalMs);
+
+    // Once a second, log a one-line snapshot of every slot's
+    // (src,dst,alive) on stderr.
+    void slotsStats(ConnTable* conns, u64 timeoutMs);
 }

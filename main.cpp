@@ -24,7 +24,7 @@ namespace {
         exit(2);
     }
 
-    int run(int argc, char** argv) {
+    void run(int argc, char** argv) {
         StringView configPath;
 
         for (int i = 1; i < argc; ++i) {
@@ -87,19 +87,17 @@ namespace {
         for (size_t i = 0; i < threads.length(); ++i) {
             threads[i]->join();
         }
-
-        return 0;
     }
 }
 
 int main(int argc, char** argv) {
     try {
-        return run(argc, argv);
+        return (run(argc, argv), 0);
     } catch (Exception& e) {
         sysE << e.description() << endL << flsH;
-        return 1;
     } catch (...) {
         sysE << StringView(u8"gofra2: unknown exception") << endL << flsH;
-        return 1;
     }
+
+    return 1;
 }

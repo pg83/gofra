@@ -331,6 +331,8 @@ void gofra::slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec) {
     for (;;) {
         u64 now = nowMs();
         StringBuilder sb;
+        u64 aliveCount = 0;
+        u64 deadCount = 0;
 
         sb << StringView(u8"gofra slots:");
 
@@ -338,6 +340,12 @@ void gofra::slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec) {
             auto* slot = slots[i];
             u64 ls = stdAtomicFetch(&slot->lastSeen, MemoryOrder::Relaxed);
             u64 alive = (now - ls <= timeoutMs) ? 1 : 0;
+
+            if (alive) {
+                ++aliveCount;
+            } else {
+                ++deadCount;
+            }
 
             char src[INET_ADDRSTRLEN];
             char dst[INET_ADDRSTRLEN];
@@ -349,6 +357,13 @@ void gofra::slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec) {
         }
 
         sysE << StringView(sb) << endL;
+
+        // Summary line for prom-via-loki ingestion: pull `dead=N` out
+        // with a regexp + unwrap. One line per stats tick keeps the
+        // log-volume cost constant.
+        sysE << StringView(u8"gofra slot_health alive=") << aliveCount
+             << StringView(u8" dead=") << deadCount << endL;
+
         sleep((unsigned)intervalSec);
     }
 }

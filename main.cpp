@@ -95,8 +95,7 @@ namespace {
              << StringView(u8" peers=") << (u64)conns->size()
              << endL;
 
-        // 2 MiB per thread stack so it sits on exactly one hugepage when fromHugePages succeeded; falls back to malloc-backed memory otherwise.
-        constexpr size_t STACK_SIZE = (size_t)2 << 20;
+        constexpr size_t STACK_SIZE = 128 * 1024;
 
         auto spawn = [&](Runable& r) {
             void* stack = pool->allocateOverAligned(STACK_SIZE, 4096);

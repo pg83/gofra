@@ -69,7 +69,7 @@ namespace {
         signal(SIGPIPE, SIG_IGN);
 
         auto slave = ObjPool::fromMemory();
-        auto* pool = ObjPool::fromHugePages(slave.mutPtr());
+        auto* pool = ObjPool::hugePages(slave.mutPtr());
 
         auto cfg = loadConfig(pool, configPath);
         auto conns = ConnTable::create(pool, cfg->peers, cfg->self,

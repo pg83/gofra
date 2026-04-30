@@ -220,18 +220,18 @@ def stat_loop(prefix, period, fn, stop):
 
 def start_stat_threads(side, get_pid, ifaces, stop):
     threads = [
-        threading.Thread(target=stat_loop, args=(f"[stats:{side}:threads]", 1.0,
-                                                  lambda: collect_threads(get_pid), stop)),
-        threading.Thread(target=stat_loop, args=(f"[stats:{side}:softirqs]", 1.0,
-                                                  collect_softirqs, stop)),
-        threading.Thread(target=stat_loop, args=(f"[stats:{side}:net]", 1.0,
-                                                  lambda: collect_net(ifaces), stop)),
-        threading.Thread(target=stat_loop, args=(f"[stats:{side}:top]", 2.0,
-                                                  lambda: collect_top(get_pid), stop)),
-        threading.Thread(target=stat_loop, args=(f"[stats:{side}:kstack]", 2.0,
-                                                  lambda: collect_kstacks(get_pid), stop)),
-        threading.Thread(target=stat_loop, args=(f"[stats:{side}:dstate]", 2.0,
-                                                  collect_d_state, stop)),
+        # threading.Thread(target=stat_loop, args=(f"[stats:{side}:threads]", 1.0,
+        #                                           lambda: collect_threads(get_pid), stop)),
+        # threading.Thread(target=stat_loop, args=(f"[stats:{side}:softirqs]", 1.0,
+        #                                           collect_softirqs, stop)),
+        # threading.Thread(target=stat_loop, args=(f"[stats:{side}:net]", 1.0,
+        #                                           lambda: collect_net(ifaces), stop)),
+        # threading.Thread(target=stat_loop, args=(f"[stats:{side}:top]", 2.0,
+        #                                           lambda: collect_top(get_pid), stop)),
+        # threading.Thread(target=stat_loop, args=(f"[stats:{side}:kstack]", 2.0,
+        #                                           lambda: collect_kstacks(get_pid), stop)),
+        # threading.Thread(target=stat_loop, args=(f"[stats:{side}:dstate]", 2.0,
+        #                                           collect_d_state, stop)),
     ]
     for t in threads:
         t.daemon = True
@@ -246,7 +246,7 @@ def cmd_remote(args):
     stop = threading.Event()
     procs = []
 
-    gofra_proc = launch(["chrt", "-f", "10", str(binary), "--config", str(cfg)],
+    gofra_proc = launch([str(binary), "--config", str(cfg)],
                         "[gofra:lab2]")
     procs.append(gofra_proc)
 
@@ -297,7 +297,7 @@ def cmd_local(args):
     procs = []
     stop = threading.Event()
 
-    gofra_proc = launch(["chrt", "-f", "10", args.gofra, "--config", str(LOCAL_TMP / "local.ini")],
+    gofra_proc = launch([args.gofra, "--config", str(LOCAL_TMP / "local.ini")],
                        "[gofra:lab1]")
     procs.append(gofra_proc)
 

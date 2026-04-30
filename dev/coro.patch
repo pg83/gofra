@@ -1,0 +1,916 @@
+diff --git a/dev/loopback.py b/dev/loopback.py
+new file mode 100755
+index 0000000..8347ec0
+--- /dev/null
++++ b/dev/loopback.py
+@@ -0,0 +1,370 @@
++#!/usr/bin/env python3
++import argparse
++import os
++import sys
++import signal
++import socket
++import subprocess
++import threading
++import time
++from pathlib import Path
++
++LAB_SSH = "lab2.nebula"
++PORT = 8060
++TUN = "gofra_smoke"
++LOCAL_VIP = "192.168.110.1"
++LAB_VIP = "192.168.110.2"
++LOCAL_UNDERLAY = "10.0.0.163"
++LAB_UNDERLAYS = ["10.0.0.68", "10.0.0.69", "10.0.0.70", "10.0.0.71"]
++LOCAL_TMP = Path("/tmp/gofra-smoke")
++SSH_DIR = "gofra-smoke"
++SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
++            "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
++PRINT_LOCK = threading.Lock()
++
++os.environ["PATH"] = "/ix/realm/llm/bin:/ix/realm/ip/bin:" + os.environ.get("PATH", "/usr/bin:/bin")
++
++
++def ini(vip):
++    peers = f"{LOCAL_VIP} = {LOCAL_UNDERLAY}:{PORT}\n"
++    peers += f"{LAB_VIP} = " + ", ".join(f"{u}:{PORT}" for u in LAB_UNDERLAYS) + "\n"
++    return (f"[me]\nvip = {vip}/24\ntun_dev = {TUN}\ntun_mtu = 1280\nuser = nobody\n\n"
++            f"[peers]\n{peers}\n[udp]\nrecv_buf = 16777216\nsend_buf = 16777216\n")
++
++
++def echo(prefix, text):
++    with PRINT_LOCK:
++        for line in text.splitlines() if text else [""]:
++            sys.stdout.write(f"{prefix} {line}\n")
++        sys.stdout.flush()
++
++
++def stream(proc, prefix):
++    for line in iter(proc.stdout.readline, b""):
++        echo(prefix, line.decode("utf-8", errors="replace").rstrip("\n"))
++
++
++def launch(cmd, prefix):
++    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                         start_new_session=True)
++    threading.Thread(target=stream, args=(p, prefix), daemon=True).start()
++    return p
++
++
++def run(cmd, **kw):
++    return subprocess.run(cmd, capture_output=True, text=True, **kw)
++
++
++def find_ip_bin():
++    for p in ("/ix/realm/ip/bin/ip", "/sbin/ip", "/bin/ip", "/usr/bin/ip"):
++        if Path(p).exists():
++            return p
++    return "ip"
++
++
++def collect_threads(get_pid):
++    pid = get_pid()
++    if not pid:
++        return "(no PID)"
++    task_dir = Path(f"/proc/{pid}/task")
++    if not task_dir.exists():
++        return f"(pid {pid} gone)"
++    out = ["TID  CPU  STATE  UTIME  STIME  WCHAN  COMM"]
++    for tid_dir in sorted(task_dir.iterdir(), key=lambda p: int(p.name)):
++        tid = tid_dir.name
++        try:
++            stat = (tid_dir / "stat").read_text().split()
++            wchan = (tid_dir / "wchan").read_text().strip() or "-"
++            comm = (tid_dir / "comm").read_text().strip()
++            state = stat[2]
++            utime = stat[13]
++            stime = stat[14]
++            cpu = stat[38] if len(stat) > 38 else "?"
++            out.append(f"{tid:>7} {cpu:>4} {state:>4}  {utime:>7} {stime:>6}  {wchan:<24} {comm}")
++        except (FileNotFoundError, IndexError):
++            pass
++    return "\n".join(out)
++
++
++def collect_softirqs():
++    return Path("/proc/softirqs").read_text().rstrip()
++
++
++def collect_kstacks(get_pid):
++    pid = get_pid()
++    if not pid:
++        return "(no PID)"
++    task_dir = Path(f"/proc/{pid}/task")
++    if not task_dir.exists():
++        return f"(pid {pid} gone)"
++    out = []
++    for tid_dir in sorted(task_dir.iterdir(), key=lambda p: int(p.name)):
++        tid = tid_dir.name
++        try:
++            stat = (tid_dir / "stat").read_text().split()
++            state = stat[2]
++            wchan = (tid_dir / "wchan").read_text().strip() or "-"
++            out.append(f"=== tid={tid} state={state} wchan={wchan} ===")
++            stack = (tid_dir / "stack").read_text().rstrip()
++            if stack:
++                for line in stack.splitlines():
++                    out.append(line)
++        except (FileNotFoundError, PermissionError):
++            pass
++    return "\n".join(out)
++
++
++def collect_d_state():
++    out = []
++    for pid_dir in Path("/proc").iterdir():
++        if not pid_dir.name.isdigit():
++            continue
++        task_dir = pid_dir / "task"
++        if not task_dir.exists():
++            continue
++        for tid_dir in task_dir.iterdir():
++            try:
++                stat = (tid_dir / "stat").read_text()
++                fields = stat[stat.rfind(")") + 2:].split()
++                state = fields[0]
++                if state != "D":
++                    continue
++                comm = stat[stat.find("(") + 1: stat.rfind(")")]
++                wchan = (tid_dir / "wchan").read_text().strip() or "-"
++                out.append(f"=== pid={pid_dir.name} tid={tid_dir.name} comm={comm} wchan={wchan} ===")
++                stack = (tid_dir / "stack").read_text().rstrip()
++                if stack:
++                    for line in stack.splitlines():
++                        out.append(line)
++            except (FileNotFoundError, PermissionError, IndexError):
++                pass
++    if not out:
++        return "(no D-state threads)"
++    return "\n".join(out)
++
++
++def collect_net(ifaces):
++    out = []
++    for line in Path("/proc/net/snmp").read_text().splitlines():
++        if line.startswith(("Udp:", "Ip:", "Tcp:")):
++            out.append(line)
++    out.append("softnet: " + Path("/proc/net/softnet_stat").read_text().replace("\n", " | "))
++    ipbin = find_ip_bin()
++    for d in ifaces:
++        r = run([ipbin, "-s", "link", "show", d], timeout=2)
++        for line in r.stdout.splitlines()[:6]:
++            out.append(line)
++    return "\n".join(out)
++
++
++def collect_top(get_pid):
++    out = []
++    pid = get_pid()
++    if pid:
++        task_dir = Path(f"/proc/{pid}/task")
++        if task_dir.exists():
++            out.append("TID STATE UTIME STIME CPU POL")
++            for tid_dir in sorted(task_dir.iterdir(), key=lambda p: int(p.name)):
++                try:
++                    stat = (tid_dir / "stat").read_text().split()
++                    out.append(f"{tid_dir.name} {stat[2]} {stat[13]} {stat[14]} {stat[38] if len(stat) > 38 else '?'} {stat[39] if len(stat) > 39 else '?'}")
++                except (FileNotFoundError, IndexError):
++                    pass
++    out.append("--- /proc/stat all cpus ---")
++    try:
++        for line in Path("/proc/stat").read_text().splitlines():
++            if not line.startswith("cpu"):
++                break
++            out.append(line)
++    except FileNotFoundError:
++        pass
++    out.append("--- /proc top by total cpu time (utime+stime) ---")
++    rows = []
++    try:
++        for pid_dir in Path("/proc").iterdir():
++            if not pid_dir.name.isdigit():
++                continue
++            try:
++                stat = (pid_dir / "stat").read_text()
++                fields = stat[stat.rfind(")") + 2:].split()
++                state = fields[0]
++                utime = int(fields[11])
++                stime = int(fields[12])
++                cpu = fields[36] if len(fields) > 36 else "?"
++                comm = stat[stat.find("(") + 1: stat.rfind(")")]
++                rows.append((utime + stime, pid_dir.name, cpu, state, comm))
++            except (FileNotFoundError, IndexError, ValueError):
++                pass
++        rows.sort(reverse=True)
++        out.append("TIME PID CPU STATE COMM")
++        for r in rows[:20]:
++            out.append(" ".join(map(str, r)))
++    except Exception as e:
++        out.append(f"top error: {e}")
++    return "\n".join(out)
++
++
++def stat_loop(prefix, period, fn, stop):
++    while not stop.is_set():
++        ts = time.time()
++        try:
++            txt = fn()
++        except Exception as e:
++            txt = f"ERROR: {e}"
++        with PRINT_LOCK:
++            for line in txt.splitlines():
++                sys.stdout.write(f"{prefix} T={ts:.3f} {line}\n")
++            sys.stdout.flush()
++        stop.wait(period)
++
++
++def start_stat_threads(side, get_pid, ifaces, stop):
++    threads = [
++        threading.Thread(target=stat_loop, args=(f"[stats:{side}:threads]", 1.0,
++                                                  lambda: collect_threads(get_pid), stop)),
++        threading.Thread(target=stat_loop, args=(f"[stats:{side}:softirqs]", 1.0,
++                                                  collect_softirqs, stop)),
++        threading.Thread(target=stat_loop, args=(f"[stats:{side}:net]", 1.0,
++                                                  lambda: collect_net(ifaces), stop)),
++        threading.Thread(target=stat_loop, args=(f"[stats:{side}:top]", 2.0,
++                                                  lambda: collect_top(get_pid), stop)),
++        threading.Thread(target=stat_loop, args=(f"[stats:{side}:kstack]", 2.0,
++                                                  lambda: collect_kstacks(get_pid), stop)),
++        threading.Thread(target=stat_loop, args=(f"[stats:{side}:dstate]", 2.0,
++                                                  collect_d_state, stop)),
++    ]
++    for t in threads:
++        t.daemon = True
++        t.start()
++    return threads
++
++
++def cmd_remote(args):
++    here = Path(__file__).parent
++    cfg = here / "lab.ini"
++    binary = here / "gofra-smoke"
++    stop = threading.Event()
++    procs = []
++
++    gofra_proc = launch(["chrt", "-f", "10", str(binary), "--config", str(cfg)],
++                        "[gofra:lab2]")
++    procs.append(gofra_proc)
++
++    start_stat_threads("lab2", lambda: gofra_proc.pid, ["eth0", "eth1", "eth2", "eth3", TUN], stop)
++
++    def cleanup(*_):
++        stop.set()
++        for p in procs:
++            try:
++                os.killpg(p.pid, signal.SIGTERM)
++            except ProcessLookupError:
++                pass
++        time.sleep(0.5)
++        sys.exit(0)
++
++    signal.signal(signal.SIGTERM, cleanup)
++    signal.signal(signal.SIGINT, cleanup)
++    signal.signal(signal.SIGHUP, cleanup)
++    procs[0].wait()
++    cleanup()
++
++
++def push(content, remote_path, mode=None):
++    cmd = ["ssh", *SSH_OPTS, f"root@{LAB_SSH}",
++           f"cat > {remote_path}" + (f" && chmod {mode} {remote_path}" if mode else "")]
++    p = subprocess.run(cmd, input=content)
++    if p.returncode:
++        raise RuntimeError(f"push to {remote_path} failed")
++
++
++def cmd_local(args):
++    if os.geteuid() != 0:
++        sys.exit("need root (sudo)")
++
++    LOCAL_TMP.mkdir(exist_ok=True)
++    (LOCAL_TMP / "local.ini").write_text(ini(LOCAL_VIP))
++
++    me = Path(__file__).read_bytes()
++    binary = Path(args.gofra).read_bytes()
++    lab_cfg = ini(LAB_VIP).encode()
++
++    echo("[setup]", "mkdir + push to lab2")
++    subprocess.run(["ssh", *SSH_OPTS, f"root@{LAB_SSH}", f"mkdir -p {SSH_DIR}"], check=True)
++    push(me, f"{SSH_DIR}/loopback.py", mode="755")
++    push(binary, f"{SSH_DIR}/gofra-smoke", mode="755")
++    push(lab_cfg, f"{SSH_DIR}/lab.ini")
++
++    procs = []
++    stop = threading.Event()
++
++    gofra_proc = launch(["chrt", "-f", "10", args.gofra, "--config", str(LOCAL_TMP / "local.ini")],
++                       "[gofra:lab1]")
++    procs.append(gofra_proc)
++
++    start_stat_threads("lab1", lambda: gofra_proc.pid, ["eth1", TUN], stop)
++
++    procs.append(launch(["ssh", *SSH_OPTS, "-T", f"root@{LAB_SSH}",
++                         f"python3 {SSH_DIR}/loopback.py remote"],
++                        "[lab2]"))
++
++    time.sleep(2)
++
++    echo("[diag]", "ip route get " + LAB_VIP)
++    r = run(["ip", "route", "get", LAB_VIP])
++    echo("[diag]", r.stdout.rstrip())
++
++    procs.append(launch(["ssh", *SSH_OPTS, "-T", f"root@{LAB_SSH}",
++                         f"iperf3 -s -B {LAB_VIP} -p 5201"],
++                        "[iperf-srv]"))
++    time.sleep(0.5)
++
++    echo("[setup]", f"iperf3 -c {LAB_VIP} -t {args.duration}")
++    cli_args = ["iperf3", "-c", LAB_VIP, "-B", LOCAL_VIP, "-p", "5201", "-t", str(args.duration)]
++    if args.mode == "udp":
++        cli_args += ["-u", "-b", args.bw]
++
++    cli = launch(cli_args, "[iperf-cli]")
++    procs.append(cli)
++
++    def cleanup(*_):
++        stop.set()
++        for p in procs:
++            try:
++                os.killpg(p.pid, signal.SIGTERM)
++            except ProcessLookupError:
++                pass
++        time.sleep(0.5)
++        sys.exit(0)
++
++    signal.signal(signal.SIGINT, cleanup)
++    signal.signal(signal.SIGTERM, cleanup)
++
++    cli.wait()
++    echo("[setup]", "iperf done; gofra still running, Ctrl-C to stop")
++    while True:
++        time.sleep(60)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    sub = ap.add_subparsers(dest="cmd")
++    p_remote = sub.add_parser("remote")
++    p_local = sub.add_parser("local")
++    p_local.add_argument("--gofra", default="./gofra")
++    p_local.add_argument("--mode", choices=["tcp", "udp"], default="tcp")
++    p_local.add_argument("--duration", type=int, default=100)
++    p_local.add_argument("--bw", default="1G")
++    args = ap.parse_args()
++    if args.cmd == "remote":
++        cmd_remote(args)
++    else:
++        if not args.cmd:
++            args.gofra = "./gofra"
++            args.mode = "tcp"
++            args.duration = 100
++            args.bw = "1G"
++        cmd_local(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/dev/loopback.sh b/dev/loopback.sh
+deleted file mode 100755
+index 442d951..0000000
+--- a/dev/loopback.sh
++++ /dev/null
+@@ -1,156 +0,0 @@
+-#!/bin/sh
+-# Smoke test over Ethernet (no nebula). Local has one NIC at
+-# 10.0.0.163; lab2 has four NICs at 10.0.0.68..71. peers[lab2.vip]
+-# lists all four lab2 underlays, so the stripe is 1×4 from local
+-# (one local src) and 4×1 from lab2 (four local srcs, one remote).
+-#
+-# No netns, no veth — direct UDP over Ethernet. ssh stays over
+-# nebula; only the gofra underlay traffic uses eth. No manual
+-# cleanup either: subreaper kills our children on exit, ssh
+-# disconnect SIGHUPs the remote gofra, and the TUN device is
+-# non-persistent so it disappears with the process. Lab2 side
+-# files land in $HOME/gofra-smoke/ (no /tmp on stalix).
+-#
+-# Layout:
+-#   local: vip 192.168.110.1/24, underlay 10.0.0.163:$PORT
+-#   lab2:  vip 192.168.110.2/24, underlays 10.0.0.{68,69,70,71}:$PORT
+-#
+-# Custom port and TUN name so we don't stomp on the deployed
+-# cluster gofra.
+-#
+-# Usage:
+-#   sudo subreaper sh dev/loopback.sh             # 10s TCP
+-#   sudo subreaper sh dev/loopback.sh tcp 30
+-#   sudo subreaper sh dev/loopback.sh udp 10 1G
+-
+-set -xu
+-
+-export PATH=/ix/realm/llm/bin:$PATH
+-
+-GOFRA=${GOFRA:-./gofra}
+-LAB_SSH=lab2.nebula              # ssh over nebula; underlay traffic uses eth
+-LOCAL_UNDERLAY=10.0.0.163        # this dev machine's eth1 IP
+-PORT=8060
+-TUN=gofra_smoke
+-LOCAL_VIP=192.168.110.1
+-LAB_VIP=192.168.110.2
+-
+-# Local scratch (real /tmp here). Lab side lands in $HOME (no /tmp
+-# on stalix); SSH_DIR is referenced as a path RELATIVE to whatever
+-# pwd ssh lands in.
+-TMP=/tmp/gofra-smoke
+-SSH_DIR=gofra-smoke
+-
+-mode=${1:-tcp}
+-secs=${2:-10}
+-udp_b=${3:-1G}
+-
+-[ "$(id -u)" -eq 0 ] || { echo "need root (sudo)" >&2; exit 1; }
+-
+-mkdir -p "$TMP"
+-
+-# Both sides see the same [peers] table — only [me].vip differs.
+-PEERS_BLOCK=$(cat <<EOF
+-[peers]
+-$LOCAL_VIP = 10.0.0.163:$PORT
+-$LAB_VIP   = 10.0.0.68:$PORT, 10.0.0.69:$PORT, 10.0.0.70:$PORT, 10.0.0.71:$PORT
+-EOF
+-)
+-
+-cat > "$TMP/local.ini" <<EOF
+-[me]
+-vip     = $LOCAL_VIP/24
+-tun_dev = $TUN
+-tun_mtu = 1280
+-user    = nobody
+-
+-$PEERS_BLOCK
+-
+-[udp]
+-recv_buf = 16777216
+-send_buf = 16777216
+-EOF
+-
+-cat > "$TMP/lab.ini" <<EOF
+-[me]
+-vip     = $LAB_VIP/24
+-tun_dev = $TUN
+-tun_mtu = 1280
+-user    = nobody
+-
+-$PEERS_BLOCK
+-
+-[udp]
+-recv_buf = 16777216
+-send_buf = 16777216
+-EOF
+-
+-SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+-
+-echo "=== underlay: local=$LOCAL_UNDERLAY  lab=10.0.0.{68,69,70,71} ==="
+-
+-ssh $SSH_OPTS "root@$LAB_SSH" "mkdir -p $SSH_DIR"
+-ssh $SSH_OPTS "root@$LAB_SSH" "cat > $SSH_DIR/gofra && chmod +x $SSH_DIR/gofra" < "$GOFRA"
+-ssh $SSH_OPTS "root@$LAB_SSH" "cat > $SSH_DIR/lab.ini" < "$TMP/lab.ini"
+-
+-# Lab gofra over a held-open ssh; channel close → SIGHUP → exit.
+-# `-T` (no pty) keeps startup log lines from sitting in a pipe
+-# block buffer; otherwise the initial "gofra: tun=..." line takes
+-# ages to surface and looks like a hang.
+-ssh $SSH_OPTS -T "root@$LAB_SSH" \
+-    "exec $SSH_DIR/gofra --config $SSH_DIR/lab.ini 2>&1" \
+-    | sed -u 's/^/[lab] /' &
+-
+-# Local gofra.
+-"$GOFRA" --config "$TMP/local.ini" &
+-
+-sleep 1
+-
+-# ssh runs commands with stalix's busybox-only PATH; iproute2's
+-# full `ip` lives at the realm path (see feedback memory).
+-LAB_IP=/ix/realm/ip/bin/ip
+-
+-echo "=== route + iface state ==="
+-echo "--- local: route to $LAB_VIP ---"
+-ip route get "$LAB_VIP" || :
+-echo "--- local: ip rule (policy routing) ---"
+-ip rule show || :
+-echo "--- local: rp_filter / accept_local on $TUN ---"
+-for k in rp_filter accept_local forwarding; do
+-    f=/proc/sys/net/ipv4/conf/$TUN/$k
+-    [ -e "$f" ] && printf '  %s = %s\n' "$k" "$(cat "$f")"
+-done
+-echo "--- local: nft ruleset ---"
+-nft list ruleset 2>&1 | head -20 || :
+-echo "--- local: $TUN ---"
+-ip -s -s link show "$TUN" || :
+-echo "--- lab: route to $LOCAL_VIP ---"
+-ssh $SSH_OPTS "root@$LAB_SSH" "$LAB_IP route get $LOCAL_VIP" || :
+-echo "--- lab: $TUN ---"
+-ssh $SSH_OPTS "root@$LAB_SSH" "$LAB_IP -s -s link show $TUN" || :
+-
+-echo "=== ping smoke ==="
+-ping -c 5 -W 2 "$LAB_VIP" || echo "(ping failed)"
+-
+-echo "=== iface state after ping ==="
+-echo "--- local: $TUN ---"
+-ip -s -s link show "$TUN" || :
+-echo "--- lab: $TUN ---"
+-ssh $SSH_OPTS "root@$LAB_SSH" "$LAB_IP -s -s link show $TUN" || :
+-
+-echo "=== iperf3 server on lab ==="
+-ssh $SSH_OPTS -T "root@$LAB_SSH" \
+-    "exec iperf3 -s -B $LAB_VIP -p 5201 2>&1" \
+-    | sed -u "s/^/[iperf3 lab] /" &
+-sleep 0.5
+-
+-echo "=== iperf3 client (mode=$mode duration=${secs}s) ==="
+-case "$mode" in
+-    tcp) iperf3 -c "$LAB_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" || true ;;
+-    udp) iperf3 -c "$LAB_VIP" -B "$LOCAL_VIP" -p 5201 -t "$secs" -u -b "$udp_b" || true ;;
+-    *)   echo "mode must be tcp|udp" >&2; exit 1 ;;
+-esac
+-
+-echo
+-echo "=== gofra still running. Ctrl-C to stop. ==="
+-wait
+diff --git a/main.cpp b/main.cpp
+index a29e0a9..ec1c698 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -7,12 +7,13 @@
+ #include <std/lib/buffer.h>
+ #include <std/lib/vector.h>
+ #include <std/mem/obj_pool.h>
+-#include <std/thr/runable.h>
+-#include <std/thr/thread.h>
+ #include <std/sys/throw.h>
+ #include <std/str/view.h>
+ #include <std/str/builder.h>
+ #include <std/ios/sys.h>
++#include <std/thr/coro.h>
++#include <std/thr/runable.h>
++#include <std/thr/io_reactor.h>
+ 
+ #include <pwd.h>
+ #include <grp.h>
+@@ -93,9 +94,17 @@ namespace {
+              << StringView(u8" peers=") << (u64)conns->size()
+              << endL;
+ 
+-        // Pool isn't thread-safe → pre-alloc scratch on this thread.
+-        Vector<Thread*> threads;
++        auto exec = CoroExecutor::create(pool.mutPtr(), 8);
++        auto io = exec->io();
++
++        // Default coro stack is 16 KB — not enough for tunReader/udpReader (gsoSplit, StringBuilder in slotsStats, libc cmsg macros). HeapContImpl has no guard pages, overflow corrupts adjacent heap silently.
++        constexpr size_t STACK = 1 << 20;
++
++        auto spawn = [&](auto f) {
++            exec->spawnRun(SpawnParams().setStackSize(STACK).setRunable(f));
++        };
+ 
++        // Pool isn't thread-safe → pre-alloc scratch on this thread before the coros spawn.
+         for (size_t i = 0; i < n; ++i) {
+             int tunFd = tunFds[i];
+             int srcFd = conns->srcFd(i);
+@@ -104,36 +113,28 @@ namespace {
+             auto* ts = makeTunReaderScratch(pool.mutPtr());
+             auto* us = makeUdpReaderScratch(pool.mutPtr());
+ 
+-            auto* tr = makeRunablePtr([tunFd, conns, ts] {
+-                tunReader(tunFd, conns, ts);
++            spawn([io, tunFd, conns, ts] {
++                tunReader(io, tunFd, conns, ts);
+             });
+ 
+-            auto* ur = makeRunablePtr([srcFd, tunFd, srcIdx, conns, us] {
+-                udpReader(srcFd, tunFd, srcIdx, conns, us);
++            spawn([io, srcFd, tunFd, srcIdx, conns, us] {
++                udpReader(io, srcFd, tunFd, srcIdx, conns, us);
+             });
+-
+-            threads.pushBack(Thread::create(pool.mutPtr(), *tr));
+-            threads.pushBack(Thread::create(pool.mutPtr(), *ur));
+         }
+ 
+         u64 probeIntervalMs = cfg->probeIntervalMs;
+         u64 probeTimeoutMs = cfg->probeTimeoutMs;
+         u64 statsIntervalSec = cfg->statsIntervalSec;
+ 
+-        auto* pr = makeRunablePtr([conns, probeIntervalMs] {
+-            prober(conns, probeIntervalMs);
++        spawn([io, conns, probeIntervalMs] {
++            prober(io, conns, probeIntervalMs);
+         });
+ 
+-        auto* st = makeRunablePtr([conns, probeTimeoutMs, statsIntervalSec] {
+-            slotsStats(conns, probeTimeoutMs, statsIntervalSec);
++        spawn([io, conns, probeTimeoutMs, statsIntervalSec] {
++            slotsStats(io, conns, probeTimeoutMs, statsIntervalSec);
+         });
+ 
+-        threads.pushBack(Thread::create(pool.mutPtr(), *pr));
+-        threads.pushBack(Thread::create(pool.mutPtr(), *st));
+-
+-        for (size_t i = 0; i < threads.length(); ++i) {
+-            threads[i]->join();
+-        }
++        exec->join();
+     }
+ }
+ 
+diff --git a/plane.cpp b/plane.cpp
+index 50b63f6..1e1598d 100644
+--- a/plane.cpp
++++ b/plane.cpp
+@@ -11,6 +11,7 @@
+ #include <std/str/view.h>
+ #include <std/str/builder.h>
+ #include <std/ios/sys.h>
++#include <std/thr/io_reactor.h>
+ 
+ #include <time.h>
+ #include <string.h>
+@@ -44,11 +45,7 @@ struct gofra::TunReaderScratch {
+     }
+ };
+ 
+-// bufs[i] = [10 B zero virtio_net_hdr | payload]; recvmmsg fills
+-// only payload (iov_base=buf+10). With UDP_GRO the kernel coalesces
+-// multiple datagrams from the same UDP flow into one buffer, hence
+-// the generous MSG_SIZE; the per-msg cbuf catches the UDP_GRO cmsg
+-// telling us each original datagram's size.
++// bufs[i] = [10 B zero virtio_net_hdr | payload]; recvmmsg fills only payload (iov_base=buf+10). UDP_GRO coalesces datagrams; cmsg carries per-original size.
+ struct gofra::UdpReaderScratch {
+     static constexpr size_t BATCH    = 64;
+     static constexpr size_t MSG_SIZE = 10 + 65536;
+@@ -100,21 +97,19 @@ namespace {
+         sysE << StringView(u8"gofra: ") << msg << endL;
+     }
+ 
+-    void sendOne(Conn* conn, const u8* pkt, size_t len) {
++    void sendOne(IoReactor* io, Conn* conn, const u8* pkt, size_t len) {
+         auto slot = conn->next(nowMs());
++        size_t nWritten = 0;
+ 
+-        ssize_t r = ::sendto(slot->srcFd, pkt, len, 0,
+-                             slot->dstAddr, addrLen(slot->dstAddr));
+-
+-        if (r < 0) {
+-            warnErrno(StringView(u8"udp sendto"), errno);
++        if (auto e = io->sendto(slot->srcFd, &nWritten, pkt, len, slot->dstAddr, addrLen(slot->dstAddr), UINT64_MAX)) {
++            warnErrno(StringView(u8"udp sendto"), e);
+         }
+     }
+ 
+     // Per-part slot for RX parallelism; under the ~65515 B cork cap.
+     constexpr int USO_PARTS = 8;
+ 
+-    void sendUso(Conn* conn, TunReaderScratch* sc, int segs) {
++    void sendUso(IoReactor* io, Conn* conn, TunReaderScratch* sc, int segs) {
+         int partSize = (segs + USO_PARTS - 1) / USO_PARTS;
+         u16 gsoSize = (u16)sc->segSizes[0];
+         u64 now = nowMs();
+@@ -151,10 +146,10 @@ namespace {
+             cm->cmsg_len   = CMSG_LEN(sizeof(u16));
+             *(u16*)CMSG_DATA(cm) = gsoSize;
+ 
+-            ssize_t r = ::sendmsg(slot->srcFd, &msg, 0);
++            size_t nWritten = 0;
+ 
+-            if (r < 0) {
+-                warnErrno(StringView(u8"udp sendmsg(USO)"), errno);
++            if (auto e = io->sendmsg(slot->srcFd, &msg, 0, &nWritten, UINT64_MAX)) {
++                warnErrno(StringView(u8"udp sendmsg(USO)"), e);
+             }
+ 
+             i = end;
+@@ -170,16 +165,16 @@ UdpReaderScratch* gofra::makeUdpReaderScratch(ObjPool* pool) {
+     return pool->make<UdpReaderScratch>(pool);
+ }
+ 
+-void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
++void gofra::tunReader(IoReactor* io, int tunFd, ConnTable* conns, TunReaderScratch* sc) {
+     for (;;) {
+-        ssize_t n = ::read(tunFd, sc->readBuf, sizeof(sc->readBuf));
++        size_t n = 0;
+ 
+-        if (n < 0) {
+-            warnErrno(StringView(u8"tun read"), errno);
++        if (auto e = io->read(tunFd, &n, sc->readBuf, sizeof(sc->readBuf), UINT64_MAX)) {
++            warnErrno(StringView(u8"tun read"), e);
+             continue;
+         }
+ 
+-        if ((size_t)n < VIRTIO_NET_HDR_LEN + 20) {
++        if (n < VIRTIO_NET_HDR_LEN + 20) {
+             continue;
+         }
+ 
+@@ -187,7 +182,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
+         decodeVirtioNetHdr(&hdr, sc->readBuf);
+ 
+         u8* inner = sc->readBuf + VIRTIO_NET_HDR_LEN;
+-        size_t innerLen = (size_t)n - VIRTIO_NET_HDR_LEN;
++        size_t innerLen = n - VIRTIO_NET_HDR_LEN;
+ 
+         u32 dstVip = 0;
+         if (!dstFromIPv4(inner, innerLen, &dstVip)) {
+@@ -203,7 +198,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
+             if (hdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
+                 gsoNoneChecksum(inner, innerLen, hdr.csumStart, hdr.csumOffset);
+             }
+-            sendOne(conn, inner, innerLen);
++            sendOne(io, conn, inner, innerLen);
+             continue;
+         }
+ 
+@@ -216,7 +211,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
+                 continue;
+             }
+ 
+-            sendUso(conn, sc, segs);
++            sendUso(io, conn, sc, segs);
+             continue;
+         }
+ 
+@@ -224,23 +219,22 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
+     }
+ }
+ 
+-void gofra::udpReader(int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpReaderScratch* sc) {
++void gofra::udpReader(IoReactor* io, int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpReaderScratch* sc) {
+     for (;;) {
+-        int n = ::recvmmsg(udpFd, sc->msgs, UdpReaderScratch::BATCH, MSG_WAITFORONE, nullptr);
++        unsigned n = 0;
+ 
+-        if (n < 0) {
+-            warnErrno(StringView(u8"udp recvmmsg"), errno);
++        if (auto e = io->recvmmsg(udpFd, sc->msgs, UdpReaderScratch::BATCH, MSG_WAITFORONE, &n, UINT64_MAX)) {
++            warnErrno(StringView(u8"udp recvmmsg"), e);
+             continue;
+         }
+ 
+         u64 now = nowMs();
+ 
+-        for (int i = 0; i < n; ++i) {
++        for (unsigned i = 0; i < n; ++i) {
+             u32 payloadLen = sc->msgs[i].msg_len;
+             msghdr* mh = &sc->msgs[i].msg_hdr;
+ 
+-            // Any incoming packet (probe or data) is liveness evidence
+-            // for the (our_src_idx, peer_src_addr) slot.
++            // Any incoming datagram (probe or data) is liveness evidence for (our_src_idx, peer_src_addr).
+             if (auto* slot = conns->lookupSlot(srcIdx, sc->addrs[i])) {
+                 stdAtomicStore(&slot->lastSeen, now, MemoryOrder::Relaxed);
+             }
+@@ -263,9 +257,7 @@ void gofra::udpReader(int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpRea
+             }
+ 
+             if (gsoSize > 0 && (u32)gsoSize < payloadLen) {
+-                // Coalesced super-buffer: split back into per-datagram
+-                // writes. virtio_net_hdr is a separate iov so we don't
+-                // mutate bufs[i]'s payload.
++                // Coalesced super-buffer: split back to per-datagram writes; virtio_net_hdr in a separate iov so payload isn't mutated.
+                 u32 off = 0;
+ 
+                 while (off < payloadLen) {
+@@ -280,26 +272,26 @@ void gofra::udpReader(int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpRea
+                         { sc->bufs[i] + VIRTIO_NET_HDR_LEN + off, chunk },
+                     };
+ 
+-                    ssize_t w = ::writev(tunFd, iov, 2);
++                    size_t w = 0;
+ 
+-                    if (w < 0) {
+-                        warnErrno(StringView(u8"tun writev"), errno);
++                    if (auto e = io->writev(tunFd, &w, iov, 2, UINT64_MAX)) {
++                        warnErrno(StringView(u8"tun writev"), e);
+                     }
+ 
+                     off += chunk;
+                 }
+             } else {
+-                ssize_t w = ::write(tunFd, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen);
++                size_t w = 0;
+ 
+-                if (w < 0) {
+-                    warnErrno(StringView(u8"tun write"), errno);
++                if (auto e = io->write(tunFd, &w, sc->bufs[i], VIRTIO_NET_HDR_LEN + payloadLen, UINT64_MAX)) {
++                    warnErrno(StringView(u8"tun write"), e);
+                 }
+             }
+         }
+     }
+ }
+ 
+-void gofra::prober(ConnTable* conns, u64 intervalMs) {
++void gofra::prober(IoReactor* io, ConnTable* conns, u64 intervalMs) {
+     Vector<ConnSlot*> slots;
+     conns->visitSlots([&slots](ConnSlot* s) {
+         slots.pushBack(s);
+@@ -309,20 +301,18 @@ void gofra::prober(ConnTable* conns, u64 intervalMs) {
+         for (size_t i = 0; i < slots.length(); ++i) {
+             auto* slot = slots[i];
+             u8 dummy = 0;
++            size_t nWritten = 0;
+ 
+-            ssize_t r = ::sendto(slot->srcFd, &dummy, 0, 0,
+-                                 slot->dstAddr, addrLen(slot->dstAddr));
+-
+-            if (r < 0) {
+-                warnErrno(StringView(u8"probe sendto"), errno);
++            if (auto e = io->sendto(slot->srcFd, &nWritten, &dummy, 0, slot->dstAddr, addrLen(slot->dstAddr), UINT64_MAX)) {
++                warnErrno(StringView(u8"probe sendto"), e);
+             }
+         }
+ 
+-        usleep((useconds_t)(intervalMs * 1000));
++        io->sleep(monotonicNowUs() + intervalMs * 1000);
+     }
+ }
+ 
+-void gofra::slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec) {
++void gofra::slotsStats(IoReactor* io, ConnTable* conns, u64 timeoutMs, u64 intervalSec) {
+     Vector<ConnSlot*> slots;
+     conns->visitSlots([&slots](ConnSlot* s) {
+         slots.pushBack(s);
+@@ -358,12 +348,10 @@ void gofra::slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec) {
+ 
+         sysE << StringView(sb) << endL;
+ 
+-        // Summary line for prom-via-loki ingestion: pull `dead=N` out
+-        // with a regexp + unwrap. One line per stats tick keeps the
+-        // log-volume cost constant.
++        // Summary line for prom-via-loki ingestion. Constant log volume per tick.
+         sysE << StringView(u8"gofra slot_health alive=") << aliveCount
+              << StringView(u8" dead=") << deadCount << endL;
+ 
+-        sleep((unsigned)intervalSec);
++        io->sleep(monotonicNowUs() + intervalSec * 1000000);
+     }
+ }
+diff --git a/plane.h b/plane.h
+index eb32714..da8cee9 100644
+--- a/plane.h
++++ b/plane.h
+@@ -4,6 +4,7 @@
+ 
+ namespace stl {
+     class ObjPool;
++    struct IoReactor;
+ }
+ 
+ namespace gofra {
+@@ -15,16 +16,12 @@ namespace gofra {
+     TunReaderScratch* makeTunReaderScratch(stl::ObjPool* pool);
+     UdpReaderScratch* makeUdpReaderScratch(stl::ObjPool* pool);
+ 
+-    void tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc);
+-    void udpReader(int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpReaderScratch* sc);
++    void tunReader(stl::IoReactor* io, int tunFd, ConnTable* conns, TunReaderScratch* sc);
++    void udpReader(stl::IoReactor* io, int udpFd, int tunFd, u32 srcIdx, ConnTable* conns, UdpReaderScratch* sc);
+ 
+-    // Single thread per gofra instance: in a loop, sendto a 0-byte UDP
+-    // probe via every (srcFd, dstAddr) slot. Receiver bumps slot.lastSeen
+-    // (RX path treats payloadLen<20 as a probe). intervalMs throttles
+-    // the loop.
+-    void prober(ConnTable* conns, u64 intervalMs);
++    // Single coroutine per gofra instance: probes every slot, throttled by intervalMs. RX path bumps slot.lastSeen on any datagram (probe or data).
++    void prober(stl::IoReactor* io, ConnTable* conns, u64 intervalMs);
+ 
+-    // Every intervalSec, log a one-line snapshot of every slot's
+-    // (src,dst,alive) on stderr.
+-    void slotsStats(ConnTable* conns, u64 timeoutMs, u64 intervalSec);
++    // Every intervalSec, log one-line snapshot of every slot's (src,dst,alive) on stderr.
++    void slotsStats(stl::IoReactor* io, ConnTable* conns, u64 timeoutMs, u64 intervalSec);
+ }
+diff --git a/socks.cpp b/socks.cpp
+index 9cdf8bb..ade532c 100644
+--- a/socks.cpp
++++ b/socks.cpp
+@@ -58,7 +58,7 @@ namespace {
+ }
+ 
+ int gofra::openUdpSocket(ObjPool* pool, const sockaddr* src, int rcvBuf, int sndBuf) {
+-    int fd = ::socket(src->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++    int fd = ::socket(src->sa_family, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+ 
+     if (fd < 0) {
+         Errno().raise(StringBuilder() << StringView(u8"socket(UDP)"));
+diff --git a/tun.cpp b/tun.cpp
+index ff82a76..05e52e7 100644
+--- a/tun.cpp
++++ b/tun.cpp
+@@ -197,7 +197,7 @@ void Netlink::linkUp(int idx) {
+ }
+ 
+ int gofra::openTun(ObjPool* pool, const char* dev) {
+-    int fd = ::open("/dev/net/tun", O_RDWR | O_CLOEXEC);
++    int fd = ::open("/dev/net/tun", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+ 
+     if (fd < 0) {
+         Errno().raise(StringBuilder() << StringView(u8"open /dev/net/tun"));

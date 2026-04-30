@@ -28,8 +28,8 @@ set -xu
 export PATH=/ix/realm/llm/bin:$PATH
 
 GOFRA=${GOFRA:-./gofra}
-LAB_SSH=lab3.nebula              # ssh over nebula; underlay traffic uses eth
-LOCAL_UNDERLAY=10.0.0.163        # this dev machine's eth1 IP
+LAB_SSH=lab2.nebula              # ssh over nebula; underlay traffic uses eth
+LOCAL_UNDERLAY=10.0.0.165        # this dev machine's eth1 IP
 PORT=8060
 TUN=gofra_smoke
 LOCAL_VIP=192.168.110.1
@@ -52,7 +52,7 @@ mkdir -p "$TMP"
 # Both sides see the same [peers] table — only [me].vip differs.
 PEERS_BLOCK=$(cat <<EOF
 [peers]
-$LOCAL_VIP = 10.0.0.163:$PORT
+$LOCAL_VIP = 10.0.0.165:$PORT
 $LAB_VIP   = 10.0.0.68:$PORT, 10.0.0.69:$PORT, 10.0.0.70:$PORT, 10.0.0.71:$PORT
 EOF
 )

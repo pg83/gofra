@@ -68,9 +68,11 @@ namespace {
 
         signal(SIGPIPE, SIG_IGN);
 
-        auto pool = ObjPool::fromMemory();
-        auto cfg = loadConfig(pool.mutPtr(), configPath);
-        auto conns = ConnTable::create(pool.mutPtr(), cfg->peers, cfg->self,
+        auto slave = ObjPool::fromMemory();
+        auto* pool = ObjPool::fromHugePages(slave.mutPtr());
+
+        auto cfg = loadConfig(pool, configPath);
+        auto conns = ConnTable::create(pool, cfg->peers, cfg->self,
                                        cfg->udpRecvBuf, cfg->udpSendBuf,
                                        cfg->probeTimeoutMs);
         size_t n = conns->srcCount();
@@ -78,7 +80,7 @@ namespace {
         Vector<int> tunFds;
 
         for (size_t i = 0; i < n; ++i) {
-            tunFds.pushBack(openTun(pool.mutPtr(), cfg->tunDev));
+            tunFds.pushBack(openTun(pool, cfg->tunDev));
         }
 
         configureTun(cfg->tunDev, cfg->tunMtu, cfg->tunVip, cfg->tunPrefixLen);
@@ -93,6 +95,14 @@ namespace {
              << StringView(u8" peers=") << (u64)conns->size()
              << endL;
 
+        // 2 MiB per thread stack so it sits on exactly one hugepage when fromHugePages succeeded; falls back to malloc-backed memory otherwise.
+        constexpr size_t STACK_SIZE = (size_t)2 << 20;
+
+        auto spawn = [&](Runable& r) {
+            void* stack = pool->allocateOverAligned(STACK_SIZE, 4096);
+            return Thread::create(pool, r, stack, STACK_SIZE);
+        };
+
         // Pool isn't thread-safe → pre-alloc scratch on this thread.
         Vector<Thread*> threads;
 
@@ -101,8 +111,8 @@ namespace {
             int srcFd = conns->srcFd(i);
             u32 srcIdx = (u32)i;
 
-            auto* ts = makeTunReaderScratch(pool.mutPtr());
-            auto* us = makeUdpReaderScratch(pool.mutPtr());
+            auto* ts = makeTunReaderScratch(pool);
+            auto* us = makeUdpReaderScratch(pool);
 
             auto* tr = makeRunablePtr([tunFd, conns, ts] {
                 tunReader(tunFd, conns, ts);
@@ -112,8 +122,8 @@ namespace {
                 udpReader(srcFd, tunFd, srcIdx, conns, us);
             });
 
-            threads.pushBack(Thread::create(pool.mutPtr(), *tr));
-            threads.pushBack(Thread::create(pool.mutPtr(), *ur));
+            threads.pushBack(spawn(*tr));
+            threads.pushBack(spawn(*ur));
         }
 
         u64 probeIntervalMs = cfg->probeIntervalMs;
@@ -128,8 +138,8 @@ namespace {
             slotsStats(conns, probeTimeoutMs, statsIntervalSec);
         });
 
-        threads.pushBack(Thread::create(pool.mutPtr(), *pr));
-        threads.pushBack(Thread::create(pool.mutPtr(), *st));
+        threads.pushBack(spawn(*pr));
+        threads.pushBack(spawn(*st));
 
         for (size_t i = 0; i < threads.length(); ++i) {
             threads[i]->join();

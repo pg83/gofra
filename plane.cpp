@@ -100,7 +100,9 @@ namespace {
         sysE << StringView(u8"gofra: ") << msg << endL;
     }
 
-    void doSendto(const ConnSlot* slot, const u8* pkt, size_t len) {
+    void sendOne(Conn* conn, const u8* pkt, size_t len) {
+        auto slot = conn->next(nowMs());
+
         ssize_t r = ::sendto(slot->srcFd, pkt, len, 0,
                              slot->dstAddr, addrLen(slot->dstAddr));
 
@@ -109,45 +111,10 @@ namespace {
         }
     }
 
-    void sendOne(Conn* conn, int copies, const u8* pkt, size_t len) {
-        u64 now = nowMs();
-        const ConnSlot* slot = conn->next(now);
-        doSendto(slot, pkt, len);
-
-        for (int c = 1; c < copies; ++c) {
-            slot = conn->next(slot, now);
-            doSendto(slot, pkt, len);
-        }
-    }
-
     // Per-part slot for RX parallelism; under the ~65515 B cork cap.
     constexpr int USO_PARTS = 8;
 
-    void doSendmsgUso(const ConnSlot* slot, iovec* iovs, size_t iovlen, u16 gsoSize) {
-        msghdr msg = {};
-        msg.msg_name    = (void*)slot->dstAddr;
-        msg.msg_namelen = addrLen(slot->dstAddr);
-        msg.msg_iov     = iovs;
-        msg.msg_iovlen  = iovlen;
-
-        alignas(cmsghdr) char cbuf[CMSG_SPACE(sizeof(u16))];
-        msg.msg_control    = cbuf;
-        msg.msg_controllen = sizeof(cbuf);
-
-        cmsghdr* cm = CMSG_FIRSTHDR(&msg);
-        cm->cmsg_level = SOL_UDP;
-        cm->cmsg_type  = UDP_SEGMENT;
-        cm->cmsg_len   = CMSG_LEN(sizeof(u16));
-        *(u16*)CMSG_DATA(cm) = gsoSize;
-
-        ssize_t r = ::sendmsg(slot->srcFd, &msg, 0);
-
-        if (r < 0) {
-            warnErrno(StringView(u8"udp sendmsg(USO)"), errno);
-        }
-    }
-
-    void sendUso(Conn* conn, int copies, TunReaderScratch* sc, int segs) {
+    void sendUso(Conn* conn, TunReaderScratch* sc, int segs) {
         int partSize = (segs + USO_PARTS - 1) / USO_PARTS;
         u16 gsoSize = (u16)sc->segSizes[0];
         u64 now = nowMs();
@@ -166,12 +133,28 @@ namespace {
                 sc->iovs[k].iov_len  = sc->segSizes[k];
             }
 
-            const ConnSlot* slot = conn->next(now);
-            doSendmsgUso(slot, &sc->iovs[i], (size_t)(end - i), gsoSize);
+            auto* slot = conn->next(now);
 
-            for (int c = 1; c < copies; ++c) {
-                slot = conn->next(slot, now);
-                doSendmsgUso(slot, &sc->iovs[i], (size_t)(end - i), gsoSize);
+            msghdr msg = {};
+            msg.msg_name    = (void*)slot->dstAddr;
+            msg.msg_namelen = addrLen(slot->dstAddr);
+            msg.msg_iov     = &sc->iovs[i];
+            msg.msg_iovlen  = (size_t)(end - i);
+
+            alignas(cmsghdr) char cbuf[CMSG_SPACE(sizeof(u16))];
+            msg.msg_control    = cbuf;
+            msg.msg_controllen = sizeof(cbuf);
+
+            cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+            cm->cmsg_level = SOL_UDP;
+            cm->cmsg_type  = UDP_SEGMENT;
+            cm->cmsg_len   = CMSG_LEN(sizeof(u16));
+            *(u16*)CMSG_DATA(cm) = gsoSize;
+
+            ssize_t r = ::sendmsg(slot->srcFd, &msg, 0);
+
+            if (r < 0) {
+                warnErrno(StringView(u8"udp sendmsg(USO)"), errno);
             }
 
             i = end;
@@ -188,8 +171,6 @@ UdpReaderScratch* gofra::makeUdpReaderScratch(ObjPool* pool) {
 }
 
 void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
-    int copies = conns->redundancy();
-
     for (;;) {
         ssize_t n = ::read(tunFd, sc->readBuf, sizeof(sc->readBuf));
 
@@ -222,7 +203,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
             if (hdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
                 gsoNoneChecksum(inner, innerLen, hdr.csumStart, hdr.csumOffset);
             }
-            sendOne(conn, copies, inner, innerLen);
+            sendOne(conn, inner, innerLen);
             continue;
         }
 
@@ -235,7 +216,7 @@ void gofra::tunReader(int tunFd, ConnTable* conns, TunReaderScratch* sc) {
                 continue;
             }
 
-            sendUso(conn, copies, sc, segs);
+            sendUso(conn, sc, segs);
             continue;
         }
 

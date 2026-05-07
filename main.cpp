@@ -74,7 +74,7 @@ namespace {
         auto cfg = loadConfig(pool, configPath);
         auto conns = ConnTable::create(pool, cfg->peers, cfg->self,
                                        cfg->udpRecvBuf, cfg->udpSendBuf,
-                                       cfg->probeTimeoutMs);
+                                       cfg->probeTimeoutMs, cfg->redundancy);
         size_t n = conns->srcCount();
 
         Vector<int> tunFds;
@@ -93,6 +93,7 @@ namespace {
              << StringView(u8" mtu=") << (u64)cfg->tunMtu
              << StringView(u8" queues=") << (u64)n
              << StringView(u8" peers=") << (u64)conns->size()
+             << StringView(u8" redundancy=") << (u64)cfg->redundancy
              << endL;
 
         constexpr size_t STACK_SIZE = 128 * 1024;

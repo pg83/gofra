@@ -67,6 +67,10 @@ namespace {
             cfg->tunMtu = (int)v->stou();
         }
 
+        if (auto* v = sec->map.find(StringView(u8"redundancy")); v) {
+            cfg->redundancy = (int)v->stou();
+        }
+
         if (auto* v = sec->map.find(StringView(u8"user")); v) {
             cfg->user = internCStr(pool, *v);
         }
@@ -124,6 +128,7 @@ Config* gofra::loadConfig(ObjPool* pool, StringView path) {
     cfg->probeIntervalMs = 200;
     cfg->probeTimeoutMs = 1000;
     cfg->statsIntervalSec = 10;
+    cfg->redundancy = 1;
     cfg->user = nullptr;
 
     Buffer pathBuf;
@@ -149,6 +154,10 @@ Config* gofra::loadConfig(ObjPool* pool, StringView path) {
 
     if (!cfg->self) {
         raise(StringBuilder() << StringView(u8"my vip is not in [peers]"));
+    }
+
+    if (cfg->redundancy < 1) {
+        raise(StringBuilder() << StringView(u8"me.redundancy must be >= 1, got ") << (u64)cfg->redundancy);
     }
 
     if (auto* sec = ini->find(StringView(u8"udp")); sec) {

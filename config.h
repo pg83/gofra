@@ -27,6 +27,8 @@ namespace gofra {
         u64 probeTimeoutMs;
         u64 statsIntervalSec;
 
+        int redundancy;
+
         const char* user;
     };
 

@@ -19,17 +19,20 @@ namespace gofra {
         u32 srcIdx;
         const sockaddr* dstAddr;
         u64 lastSeen;
+        u32 connIdx;
     };
 
     struct Conn {
         virtual u32 vip() const noexcept = 0;
         virtual const ConnSlot* next(u64 nowMs) noexcept = 0;
+        virtual const ConnSlot* next(const ConnSlot* cur, u64 nowMs) noexcept = 0;
     };
 
     struct ConnTable {
         virtual size_t size() const noexcept = 0;
         virtual size_t srcCount() const noexcept = 0;
         virtual int srcFd(size_t i) const noexcept = 0;
+        virtual int redundancy() const noexcept = 0;
         virtual Conn* lookup(u32 vip) const noexcept = 0;
 
         // RX-side: look up the slot whose (srcIdx, dstAddr) matches the
@@ -47,6 +50,6 @@ namespace gofra {
         }
 
         static ConnTable* create(stl::ObjPool* pool, PeerTable* peers, Peer* self,
-                                 int rcvBuf, int sndBuf, u64 timeoutMs);
+                                 int rcvBuf, int sndBuf, u64 timeoutMs, int redundancy);
     };
 }

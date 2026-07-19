@@ -34,6 +34,20 @@ TCP hits ~3.5 Gbit/s on a 4×1Gbps lab stripe.
 That's the whole feature set. No replay window, no MAC, no
 authentication, no roaming. If you want any of that, run nebula.
 
+## Build
+
+The build expects the `std` source tree and its `std/libstd.a` archive in the
+sibling `../std` directory. It also needs a C++26 compiler and `libmnl`
+available through pkg-config. Inside the IX development environment, run:
+
+```sh
+./build gofra
+```
+
+This builds through the content-addressed `.build` cache and publishes
+`./gofra` as a symlink to the resulting executable. Running `./build` without
+an explicit target builds the same program without publishing the symlink.
+
 ## Config
 
 INI. `[me]` identifies us; `[peers]` is the full cluster table with

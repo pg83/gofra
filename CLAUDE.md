@@ -131,7 +131,7 @@ prefix and the kernel sees a normal packet.
 ## Dev workflow
 
 ```sh
-make -j               # builds gofra against ../std/std/libstd.a
+./build gofra          # builds gofra against ../std/std/libstd.a
 sudo subreaper sh dev/loopback.sh tcp 30   # 30 s TCP smoke over the local→lab2 stripe
 sudo sh dev/perf.sh 30                     # perf record on the deployed cluster gofra
 ```

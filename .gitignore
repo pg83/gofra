@@ -1,4 +1,6 @@
 /gofra
+/.build/
+/__pycache__/
 *.pzd
 *.o
 /perf-*.data
